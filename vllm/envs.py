@@ -202,6 +202,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
+    VLLM_STARSCREAM_USE_SYMM_MEM: bool = False
+    VLLM_STARSCREAM_FUSE_REDUCE: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -1396,6 +1398,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use pytorch symmetric memory for allreduce
     "VLLM_ALLREDUCE_USE_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_SYMM_MEM", "1"))
+    ),
+    # Starscream (CPX+NPS4): use a symmetric-memory Triton allgather in place
+    # of the RCCL/NCCL cross-XCD allgather before reduce_segments. Semantics
+    # are preserved; the unmodified reduce_segments still runs.
+    "VLLM_STARSCREAM_USE_SYMM_MEM": lambda: bool(
+        int(os.getenv("VLLM_STARSCREAM_USE_SYMM_MEM", "0"))
+    ),
+    # Starscream (CPX+NPS4): fuse the cross-XCD allgather and the
+    # reduce_segments online-softmax merge into a single symmetric-memory
+    # Triton kernel. Implies the symm-mem path. reduce_segments is left intact.
+    "VLLM_STARSCREAM_FUSE_REDUCE": lambda: bool(
+        int(os.getenv("VLLM_STARSCREAM_FUSE_REDUCE", "0"))
     ),
     # Allows vllm to find tuned config under customized folder
     "VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),

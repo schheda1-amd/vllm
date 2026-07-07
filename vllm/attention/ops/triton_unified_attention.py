@@ -1099,7 +1099,37 @@ def unified_attention(
         )
 
     if cpx_size > 1 and enable_starscream:
-        starscream_metadata = get_dcp_group().all_gather(starscream_meta_out.contiguous(), dim=-2).contiguous()
+        import vllm.envs as envs
+
+        # Path A: single fused symm-mem allgather + reduce_segments merge.
+        if envs.VLLM_STARSCREAM_FUSE_REDUCE:
+            from vllm.attention.ops.starscream_symm_reduce import (
+                fused_all_gather_reduce_segments,
+            )
+
+            fused = fused_all_gather_reduce_segments(
+                out=out,
+                starscream_meta_out=starscream_meta_out,
+                num_query_heads=num_query_heads,
+                head_size=head_size,
+                output_scale=output_scale,
+                float8_info=float8_info,
+            )
+            if fused:
+                return
+
+        # Path B: symm-mem allgather feeding the unmodified reduce_segments.
+        if envs.VLLM_STARSCREAM_USE_SYMM_MEM:
+            from vllm.attention.ops.starscream_symm_reduce import (
+                symm_mem_all_gather,
+            )
+
+            starscream_metadata = symm_mem_all_gather(
+                starscream_meta_out.contiguous()
+            ).contiguous()
+        else:
+            # Path C (default): stock RCCL/NCCL allgather.
+            starscream_metadata = get_dcp_group().all_gather(starscream_meta_out.contiguous(), dim=-2).contiguous()
         starscream_flag = True
 
         reduce_segments[(q.shape[0], num_query_heads)](
