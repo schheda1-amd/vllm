@@ -5,6 +5,34 @@ remote cluster). This documents the symmetric-memory replacement for the RCCL
 cross-XCD allgather in the Starscream (CPX+NPS4) decode attention path, and the
 fusion of that allgather with `reduce_segments`.
 
+## Docker container
+
+Launch the container from the directory containing the vllm repo (it is mounted
+at `/workspace/vllm`):
+
+```bash
+docker run \
+    -it --rm \
+    --device /dev/dri --device /dev/kfd \
+    --network host --ipc host \
+    --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged \
+    -v .:/workspace/vllm \
+    --shm-size 128G \
+    rocm/vllm:rocm7.13.0_gfx94X-dcgpu_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1 /bin/bash
+```
+
+The container ships a pre-built vllm. Use `PYTHONPATH` to override it with the
+mounted source tree (no rebuild needed — the compiled `vllm._C` extension in the
+system install is still used, warnings about it are harmless):
+
+```bash
+PYTHONPATH=/workspace/vllm \
+TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
+torchrun --nnodes=1 --nproc-per-node=8 \
+  /workspace/vllm/tests/kernels/attention/test_starscream_symm_reduce.py \
+  --mode all --cpx-size 8 --num-tokens 32 --num-heads 64 --head-size 128 --seq-len 4096
+```
+
 ## Background
 
 Starscream shards each sequence's KV context across the XCDs (vGPUs) of one

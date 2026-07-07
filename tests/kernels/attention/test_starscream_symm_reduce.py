@@ -53,15 +53,29 @@ import torch
 import torch.distributed as dist
 
 # ---------------------------------------------------------------------------
-# Bootstrap distributed environment exactly as the reference scripts do.
-# Must happen before any vllm.distributed import.
+# Bootstrap distributed environment via vllm so that _WORLD is set before
+# initialize_model_parallel is called.
 # ---------------------------------------------------------------------------
-_rank = int(os.environ.get("RANK", 0))
+_rank       = int(os.environ.get("RANK", 0))
 _local_rank = int(os.environ.get("LOCAL_RANK", 0))
 _world_size = int(os.environ.get("WORLD_SIZE", 1))
 
 torch.cuda.set_device(_local_rank)
-dist.init_process_group(backend="nccl", world_size=_world_size, rank=_rank)
+
+from vllm.distributed.parallel_state import (  # noqa: E402
+    init_distributed_environment,
+    initialize_model_parallel,
+    get_dcp_group,
+    destroy_model_parallel,
+)
+
+init_distributed_environment(
+    world_size=_world_size,
+    rank=_rank,
+    local_rank=_local_rank,
+    distributed_init_method=f"env://",
+    backend="nccl",
+)
 
 # Enable symmetric memory for the default group (deprecated no-op on newer
 # torch; safe to call either way).
@@ -70,13 +84,6 @@ try:
     _symm_mem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
 except Exception:
     pass
-
-# Now safe to import vllm.distributed.
-from vllm.distributed.parallel_state import (  # noqa: E402
-    initialize_model_parallel,
-    get_dcp_group,
-    destroy_model_parallel,
-)
 
 
 # ---------------------------------------------------------------------------
