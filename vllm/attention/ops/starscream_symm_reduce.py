@@ -139,8 +139,7 @@ def _fused_allgather_reduce_kernel(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
-    HP = HEAD_SIZE_PADDED
-    d = tl.arange(0, HP)
+    d = tl.arange(0, HEAD_SIZE_PADDED)
     dim_mask = d < HEAD_SIZE
 
     # Per-(token, head) offset is the same inside every peer's staging buffer,
@@ -153,18 +152,18 @@ def _fused_allgather_reduce_kernel(
     overall_max = float("-inf")
     for p in tl.static_range(CPX):
         peer_ptr = tl.load(peer_ptrs + p).to(tl.pointer_type(tl.float32))
-        m_p = tl.load(peer_ptr + src_base + HP + 1)
+        m_p = tl.load(peer_ptr + src_base + HEAD_SIZE_PADDED + 1)
         overall_max = tl.maximum(overall_max, m_p)
 
     # Pass 2: rescale each XCD's numerator and exp-sum to the common max and
     # accumulate. Mirrors the batch formulation exactly (rescale then sum).
-    acc = tl.zeros([HP], dtype=tl.float32)
+    acc = tl.zeros([HEAD_SIZE_PADDED], dtype=tl.float32)
     overall_expsum = tl.zeros([], dtype=tl.float32)
     for p in tl.static_range(CPX):
         peer_ptr = tl.load(peer_ptrs + p).to(tl.pointer_type(tl.float32))
         num_p = tl.load(peer_ptr + src_base + d, mask=dim_mask, other=0.0)
-        l_p = tl.load(peer_ptr + src_base + HP)
-        m_p = tl.load(peer_ptr + src_base + HP + 1)
+        l_p = tl.load(peer_ptr + src_base + HEAD_SIZE_PADDED)
+        m_p = tl.load(peer_ptr + src_base + HEAD_SIZE_PADDED + 1)
         scale = tl.exp(m_p - overall_max)
         acc += num_p * scale
         overall_expsum += l_p * scale
