@@ -87,12 +87,72 @@ partials directly over symm-mem peer pointers inside the same kernel** that does
 the merge and scatter. One launch, no intermediate gathered buffer, no separate
 collective.
 
-## Test progression (intended)
+## Tests
+
+Test file: `tests/kernels/attention/test_starscream_symm_reduce.py`
+
+The test is self-contained and driven by `torchrun` directly — no pytest, no
+Ray. It builds the `starscream_meta_out` tensor exactly as
+`triton_unified_attention.py` does (same shape, same slot layout), then invokes
+the new paths and compares against the RCCL baseline (`get_dcp_group().all_gather`
+→ `reduce_segments`).
+
+### Contained test cases
+
+| Test | What it checks |
+|------|---------------|
+| `test_step1_output_matches_baseline` | (a) symm-mem gathered tensor == RCCL gathered tensor; (b) reduce_segments output fed from symm-mem gather == baseline output |
+| `test_step2_output_matches_baseline` | fused kernel output == baseline output |
+| `test_randomized_inputs` | both Step 1 and Step 2 vs. baseline across 8 independent random seeds |
+
+### Run commands (inside the ROCm/PyTorch docker container)
+
+```bash
+# --- Step 1 only ---
+VLLM_STARSCREAM_USE_SYMM_MEM=1 \
+TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
+torchrun --nnodes=1 --nproc-per-node=8 \
+  tests/kernels/attention/test_starscream_symm_reduce.py \
+  --mode step1 --cpx-size 8 --num-tokens 32 --num-heads 64 --head-size 128 --seq-len 4096
+
+# --- Step 2 only ---
+VLLM_STARSCREAM_FUSE_REDUCE=1 \
+TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
+torchrun --nnodes=1 --nproc-per-node=8 \
+  tests/kernels/attention/test_starscream_symm_reduce.py \
+  --mode step2 --cpx-size 8 --num-tokens 32 --num-heads 64 --head-size 128 --seq-len 4096
+
+# --- Both (recommended first run) ---
+TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
+torchrun --nnodes=1 --nproc-per-node=8 \
+  tests/kernels/attention/test_starscream_symm_reduce.py \
+  --mode all --cpx-size 8 --num-tokens 32 --num-heads 64 --head-size 128 --seq-len 4096
+
+# --- Tighter tolerance if you want to catch ULP noise ---
+TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
+torchrun --nnodes=1 --nproc-per-node=8 \
+  tests/kernels/attention/test_starscream_symm_reduce.py \
+  --mode all --cpx-size 8 --rtol 1e-5 --atol 1e-5
+```
+
+All parameters:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode` | `all` | `step1`, `step2`, or `all` |
+| `--num-tokens` | 16 | T dimension |
+| `--num-heads` | 32 | H (must be divisible by `--cpx-size`) |
+| `--head-size` | 128 | head dimension |
+| `--cpx-size` | world_size | XCDs in the group; must equal `--nproc-per-node` |
+| `--seq-len` | 4096 | full sequence length (informational for this test) |
+| `--rtol` / `--atol` | 1e-3 | match tolerances |
+| `--trials` | 8 | random trial count for randomized test |
+
+### Test progression (intended)
 
 1. **Functional correctness** — Step 1 first (smallest change: only the
    collective is swapped), then Step 2.
-2. **Output matching for randomized inputs** — compare Step 1 and Step 2 outputs
-   against Path C (baseline) to ensure nothing was missed semantically.
+2. **Output matching for randomized inputs** — `--mode all` covers this.
 3. **Performance runs** — Step 2 is the target; Step 1 is a useful intermediate
    data point.
 
