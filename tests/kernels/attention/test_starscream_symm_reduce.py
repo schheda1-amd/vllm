@@ -491,16 +491,16 @@ def main() -> None:
         f"--num-heads ({args.num_heads}) must be divisible by "
         f"--cpx-size ({args.cpx_size})"
     )
-    assert args.cpx_size == _world_size, (
-        f"--cpx-size ({args.cpx_size}) must equal WORLD_SIZE ({_world_size}). "
-        "Pass --nproc-per-node=<cpx-size> to torchrun."
+    assert _world_size % args.cpx_size == 0, (
+        f"WORLD_SIZE ({_world_size}) must be divisible by "
+        f"--cpx-size ({args.cpx_size}). Each physical GPU contributes cpx_size ranks."
     )
 
-    # Initialise the DCP group to match CPX topology: TP==cpx_size, DCP==cpx_size.
-    # With TP==DCP==cpx_size, all_ranks.reshape(-1, dcp_size) gives one group
-    # containing every rank -- the XCDs of one physical GPU.
+    # TP == world_size (all vGPUs in one TP group).
+    # DCP == cpx_size (one DCP group per physical GPU, each covering its XCDs).
+    # This gives world_size // cpx_size independent DCP groups, one per physical GPU.
     initialize_model_parallel(
-        tensor_model_parallel_size=args.cpx_size,
+        tensor_model_parallel_size=_world_size,
         pipeline_model_parallel_size=1,
         decode_context_model_parallel_size=args.cpx_size,
     )
