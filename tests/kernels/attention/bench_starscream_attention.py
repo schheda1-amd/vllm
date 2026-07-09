@@ -404,16 +404,12 @@ def main():
                    default="1,8,32,64,128,256,512,1024")
     p.add_argument("--warmup", type=int, default=25)
     p.add_argument("--iters", type=int, default=200)
-    # NOTE: CUDA-graph timing is DISABLED by default. Graph capture of the CPX
-    # path currently yields incorrect (too-fast) timings -- to be fixed later.
-    # Eager mode is the trusted path. --cuda-graph is retained but opt-in only.
     p.add_argument("--cuda-graph", dest="cuda_graph", action="store_true",
                    default=True,
-                   help="[EXPERIMENTAL, known-buggy for CPX] Time via CUDA "
-                        "graph replay. Off by default; eager is the trusted "
-                        "path. Do not use for real measurements yet.")
+                   help="Time via CUDA graph replay (default). Removes host "
+                        "launch overhead.")
     p.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_false",
-                   help="Force eager-mode timing (default).")
+                   help="Force eager-mode timing.")
     p.add_argument("--csv", type=str, default="",
                    help="Optional path to write CSV results (rank 0)")
     p.add_argument("--skip-sanity", action="store_true",

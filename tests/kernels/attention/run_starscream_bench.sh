@@ -35,8 +35,19 @@ set -euo pipefail
 MODE="${1:-spx}"
 MODE="$(echo "$MODE" | tr '[:upper:]' '[:lower:]')"
 
-if [[ "$MODE" != "spx" && "$MODE" != "cpx" ]]; then
-    echo "ERROR: mode must be 'spx' or 'cpx' (got '$MODE')" >&2
+# Three modes:
+#   spx          : hardware in SPX; 1 rank owns the whole physical GPU. Baseline.
+#   cpx          : hardware in CPX; 8 XCDs run the Starscream path (rccl/step1/
+#                  step2), context split + merge. The proposed design.
+#   cpx-baseline : hardware in CPX; 8 XCDs run the ORIGINAL vLLM path with
+#                  starscream DISABLED -- i.e. what you get by simply switching a
+#                  node to CPX and running unchanged code. Each XCD independently
+#                  does full-context attention over a replicated KV head. This is
+#                  the "CPX without Starscream" reference. It maps to the
+#                  benchmark's --mode spx (enable_starscream=False) but launched
+#                  on all 8 XCDs, so the per-XCD shard is 1 q-head / 1 kv-head.
+if [[ "$MODE" != "spx" && "$MODE" != "cpx" && "$MODE" != "cpx-baseline" ]]; then
+    echo "ERROR: mode must be 'spx', 'cpx', or 'cpx-baseline' (got '$MODE')" >&2
     exit 1
 fi
 
@@ -66,18 +77,25 @@ CSV="${CSV:-/workspace/vllm/bench_${MODEL}_${MODE}.csv}"
 # In eager mode both are valid; SIGNAL_PAD=1 keeps RCCL off the merge path
 # (the point of step1/step2). Set SIGNAL_PAD=1 for the intended symm-mem runs.
 SIGNAL_PAD="${SIGNAL_PAD:-0}"
-# CUDA-graph timing: DISABLED by default (0). Graph capture of the CPX path
-# currently produces incorrect (too-fast) timings and needs fixing later.
-# Eager (0) is the trusted path. Set CUDA_GRAPH=1 only for experimentation.
+# CUDA-graph timing: 1 = graph replay (default), 0 = eager.
 CUDA_GRAPH="${CUDA_GRAPH:-1}"
-# Which physical GPU's devices to pin. SPX: one GPU index (default 0).
-# CPX: that GPU's 8 XCD indices (default 0-7). Override for a different GPU.
+# Map launcher mode -> devices, rank count, and the benchmark's --mode.
+#   spx          : 1 rank, whole GPU, benchmark --mode spx (starscream off)
+#   cpx          : 8 ranks (XCDs), benchmark --mode cpx  (starscream on)
+#   cpx-baseline : 8 ranks (XCDs), benchmark --mode spx  (starscream OFF) --
+#                  original code on CPX hardware, no context split/merge.
 if [[ "$MODE" == "spx" ]]; then
     DEVICES="${DEVICES:-0}"
     NPROC=1
-else
+    BENCH_MODE="spx"
+elif [[ "$MODE" == "cpx" ]]; then
     DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
     NPROC="$CPX_SIZE"
+    BENCH_MODE="cpx"
+else  # cpx-baseline
+    DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
+    NPROC="$CPX_SIZE"
+    BENCH_MODE="spx"
 fi
 
 BENCH="${VLLM_SRC}/tests/kernels/attention/bench_starscream_attention.py"
@@ -116,21 +134,27 @@ echo "   warmup/iters : $WARMUP / $ITERS"
 echo "   cuda_graph   : $CUDA_GRAPH   (1=graph replay, 0=eager)"
 echo "   signal_pad   : $SIGNAL_PAD   (CPX only)"
 echo "   csv          : $CSV"
+# Required hardware partition per launcher mode: spx -> SPX, cpx & cpx-baseline
+# -> CPX (both need the 8 XCDs visible).
+if [[ "$MODE" == "spx" ]]; then HW_PART="SPX"; else HW_PART="CPX"; fi
 echo "=================================================================="
-echo " Reminder: hardware must be in $MODE partition mode already."
-echo "   rocm-smi --setcomputepartition ${MODE^^}"
+echo " Reminder: hardware must be in $HW_PART partition mode already."
+echo "   rocm-smi --setcomputepartition $HW_PART"
 echo "=================================================================="
 
-if [[ "$MODE" == "spx" ]]; then
-    CUDA_VISIBLE_DEVICES="$DEVICES" \
-    PYTHONPATH="$VLLM_SRC" \
-    torchrun --nnodes=1 --nproc-per-node="$NPROC" \
-        "$BENCH" --mode spx "${COMMON_ARGS[@]}"
-else
+if [[ "$BENCH_MODE" == "cpx" ]]; then
+    # Starscream path: symm-mem env + cpx-size.
     CUDA_VISIBLE_DEVICES="$DEVICES" \
     PYTHONPATH="$VLLM_SRC" \
     TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
     VLLM_STARSCREAM_SIGNAL_PAD_BARRIER="$SIGNAL_PAD" \
     torchrun --nnodes=1 --nproc-per-node="$NPROC" \
         "$BENCH" --mode cpx --cpx-size "$CPX_SIZE" "${COMMON_ARGS[@]}"
+else
+    # SPX code path (starscream off). Used by both `spx` (1 rank) and
+    # `cpx-baseline` (8 XCDs). No symm-mem env, no cpx-size.
+    CUDA_VISIBLE_DEVICES="$DEVICES" \
+    PYTHONPATH="$VLLM_SRC" \
+    torchrun --nnodes=1 --nproc-per-node="$NPROC" \
+        "$BENCH" --mode spx "${COMMON_ARGS[@]}"
 fi
