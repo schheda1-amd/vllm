@@ -353,20 +353,40 @@ def _bench_variant(mode, tn, grp, cpx, head_size, warmup, iters, use_graph):
     return _bench_variant_eager(mode, tn, grp, cpx, head_size, warmup, iters)
 
 
+# Per-GPU attention shard shapes under TP=8 (single physical GPU focus).
+# Full-model heads / TP: Llama3 uses GQA with 8 KV heads, head_dim 128.
+#   Llama3-70B : 64 q-heads,  8 kv-heads -> /8 -> 8 q, 1 kv
+#   Llama3-405B: 128 q-heads, 8 kv-heads -> /8 -> 16 q, 1 kv
+_MODEL_CONFIGS = {
+    "llama3-70b":  {"q_heads": 8,  "kv_heads": 1, "head_size": 128},
+    "llama3-405b": {"q_heads": 16, "kv_heads": 1, "head_size": 128},
+}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["spx", "cpx"], required=True)
+    p.add_argument("--model", choices=sorted(_MODEL_CONFIGS.keys()),
+                   default=None,
+                   help="If set, overrides --total-q-heads/--total-kv-heads/"
+                        "--head-size with that model's per-GPU TP=8 attention "
+                        "shard. Llama3-70b -> 8q/1kv/128; "
+                        "Llama3-405b -> 16q/1kv/128.")
     p.add_argument("--cpx-size", type=int, default=8,
                    help="XCDs per physical GPU (CPX mode)")
-    p.add_argument("--total-q-heads", type=int, default=8,
-                   help="Query heads visible to this benchmark's device set. "
-                        "Single-GPU focus: Llama3-70B under TP=8 -> 64/8 = 8 "
-                        "q-heads per GPU. (Divided by num_physical internally, "
-                        "which is 1 in the single-GPU setup.)")
-    p.add_argument("--total-kv-heads", type=int, default=1,
-                   help="KV heads for this device set. Llama3-70B GQA under "
-                        "TP=8 -> 8/8 = 1 kv-head per GPU.")
-    p.add_argument("--head-size", type=int, default=128)
+    # These default to None so we can tell whether the user set them explicitly.
+    # Resolution order: model preset -> explicit arg (if given) -> llama3-70b
+    # fallback when neither model nor arg is provided.
+    p.add_argument("--total-q-heads", type=int, default=None,
+                   help="Query heads for this device set (per-GPU TP=8 shard). "
+                        "Overrides the --model preset if given. Falls back to "
+                        "llama3-70b (8) if neither --model nor this is set.")
+    p.add_argument("--total-kv-heads", type=int, default=None,
+                   help="KV heads for this device set. Overrides --model if "
+                        "given. Falls back to llama3-70b (1).")
+    p.add_argument("--head-size", type=int, default=None,
+                   help="Head dimension. Overrides --model if given. Falls "
+                        "back to llama3-70b (128).")
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--seq-lens", type=str, default="256,8192,131072",
                    help="Base context lengths (KV cache size at the START of "
@@ -384,14 +404,16 @@ def main():
                    default="1,8,32,64,128,256,512,1024")
     p.add_argument("--warmup", type=int, default=25)
     p.add_argument("--iters", type=int, default=200)
+    # NOTE: CUDA-graph timing is DISABLED by default. Graph capture of the CPX
+    # path currently yields incorrect (too-fast) timings -- to be fixed later.
+    # Eager mode is the trusted path. --cuda-graph is retained but opt-in only.
     p.add_argument("--cuda-graph", dest="cuda_graph", action="store_true",
                    default=True,
-                   help="Time via CUDA graph replay (default). Removes host "
-                        "launch overhead. Falls back to eager per-variant if "
-                        "capture fails (e.g. a host dist.barrier in the path -- "
-                        "use SIGNAL_PAD=1 so step1/step2 stay capturable).")
+                   help="[EXPERIMENTAL, known-buggy for CPX] Time via CUDA "
+                        "graph replay. Off by default; eager is the trusted "
+                        "path. Do not use for real measurements yet.")
     p.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_false",
-                   help="Force eager-mode timing (includes launch overhead).")
+                   help="Force eager-mode timing (default).")
     p.add_argument("--csv", type=str, default="",
                    help="Optional path to write CSV results (rank 0)")
     p.add_argument("--skip-sanity", action="store_true",
@@ -401,6 +423,16 @@ def main():
     p.add_argument("--sanity-batch", type=int, default=1,
                    help="batch size for the pre-sweep sanity check")
     args = p.parse_args()
+
+    # --- Resolve head shapes: model preset (or llama3-70b fallback) as the
+    # base, then any explicitly-passed head arg overrides that dimension. ---
+    cfg = _MODEL_CONFIGS[args.model or "llama3-70b"]
+    if args.total_q_heads is None:
+        args.total_q_heads = cfg["q_heads"]
+    if args.total_kv_heads is None:
+        args.total_kv_heads = cfg["kv_heads"]
+    if args.head_size is None:
+        args.head_size = cfg["head_size"]
 
     # --- Mode / hardware consistency check ---
     if args.mode == "cpx":
@@ -421,6 +453,7 @@ def main():
     _log(f"  physical GPUs          : {num_physical}")
     if args.mode == "cpx":
         _log(f"  cpx_size (XCDs/GPU)    : {cpx}   -> {num_physical} DCP groups")
+    _log(f"  model preset           : {args.model or '(explicit heads)'}")
     _log(f"  total q-heads / kv-heads: {args.total_q_heads} / {args.total_kv_heads}")
     _log(f"  head_size / block_size : {args.head_size} / {args.block_size}")
     _log(f"  warmup / iters         : {args.warmup} / {args.iters}  (MAX over ranks)")

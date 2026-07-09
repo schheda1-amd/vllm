@@ -5,23 +5,29 @@
 # Launcher for the Starscream SPX-vs-CPX attention benchmark.
 #
 # Usage:
-#   ./run_starscream_bench.sh [spx|cpx]        # mode defaults to spx
+#   ./run_starscream_bench.sh [spx|cpx] [model]   # mode defaults to spx
+#     model (optional): llama3-70b (default) | llama3-405b
+#       Sets the per-GPU TP=8 attention shard:
+#         llama3-70b  -> 8 q / 1 kv / head_size 128
+#         llama3-405b -> 16 q / 1 kv / head_size 128
+#       An explicit Q_HEADS/KV_HEADS/HEAD_SIZE env still overrides everything.
 #
 # The HARDWARE compute-partition mode must already match the requested mode:
-#   SPX -> `rocm-smi --setcomputepartition SPX`  (8 physical GPUs)
-#   CPX -> `rocm-smi --setcomputepartition CPX`  (64 vGPUs / XCDs)
+#   SPX -> `rocm-smi --setcomputepartition SPX`  (single physical GPU, 1 rank)
+#   CPX -> `rocm-smi --setcomputepartition CPX`  (that GPU's 8 XCDs)
 # This script does NOT switch the partition mode for you.
 #
 # Environment overrides (optional):
 #   VLLM_SRC     path to the mounted vllm source   (default: /workspace/vllm)
+#   MODEL        llama3-70b | llama3-405b           (default: llama3-70b; or arg 2)
 #   SEQ_LENS     comma list of seq lengths          (default: 256,8192,131072)
+#   TOKEN_OFFSETS output-token offsets per base S    (default: 0)
 #   BATCH_SIZES  comma list of batch sizes          (default: 1,8,32,64,128,256,512,1024)
-#   Q_HEADS      total query heads                   (default: 128)
-#   KV_HEADS     total kv heads                      (default: 128)
-#   HEAD_SIZE    head dimension                      (default: 128)
+#   Q_HEADS/KV_HEADS/HEAD_SIZE  override the model preset (default: unset)
 #   CPX_SIZE     XCDs per physical GPU (cpx mode)    (default: 8)
-#   WARMUP       warmup iters                        (default: 10)
-#   ITERS        timed iters                         (default: 50)
+#   SIGNAL_PAD   1 = on-device signal-pad barrier    (default: 0)
+#   WARMUP       warmup iters                        (default: 25)
+#   ITERS        timed iters                         (default: 200)
 #   CSV          output csv path                     (default: /workspace/bench_<mode>.csv)
 
 set -euo pipefail
@@ -34,6 +40,14 @@ if [[ "$MODE" != "spx" && "$MODE" != "cpx" ]]; then
     exit 1
 fi
 
+# Model preset: arg 2 (if given) else $MODEL else llama3-70b.
+MODEL="${2:-${MODEL:-llama3-70b}}"
+MODEL="$(echo "$MODEL" | tr '[:upper:]' '[:lower:]')"
+if [[ "$MODEL" != "llama3-70b" && "$MODEL" != "llama3-405b" ]]; then
+    echo "ERROR: model must be 'llama3-70b' or 'llama3-405b' (got '$MODEL')" >&2
+    exit 1
+fi
+
 VLLM_SRC="${VLLM_SRC:-/workspace/vllm}"
 SEQ_LENS="${SEQ_LENS:-256,8192,131072}"
 # Output-token offsets added to each base seq-len (KV grows as tokens generate).
@@ -41,22 +55,20 @@ SEQ_LENS="${SEQ_LENS:-256,8192,131072}"
 # first 257 output tokens and reports per-output-token attention latency.
 TOKEN_OFFSETS="${TOKEN_OFFSETS:-0}"
 BATCH_SIZES="${BATCH_SIZES:-1,8,32,64,128,256,512,1024}"
-# Llama3-70B under TP=8, single-GPU focus: per-GPU shard is 8 q-heads,
-# 1 kv-head (GQA 64/8 q, 8/8 kv), head_size 128.
-Q_HEADS="${Q_HEADS:-8}"
-KV_HEADS="${KV_HEADS:-1}"
-HEAD_SIZE="${HEAD_SIZE:-128}"
+# Head shapes come from the model preset (--model), applied by the benchmark.
+# Q_HEADS / KV_HEADS / HEAD_SIZE are UNSET by default so the preset wins; set
+# any of them to override the preset for that dimension.
 CPX_SIZE="${CPX_SIZE:-8}"
 WARMUP="${WARMUP:-25}"
 ITERS="${ITERS:-200}"
-CSV="${CSV:-/workspace/vllm/bench_${MODE}.csv}"
+CSV="${CSV:-/workspace/vllm/bench_${MODEL}_${MODE}.csv}"
 # On-device signal-pad barrier (1) vs host dist.barrier (0). Only affects CPX.
-# NOTE: CUDA-graph timing needs SIGNAL_PAD=1 for step1/step2 to be capturable
-# (a host dist.barrier is not graph-capturable; those variants fall back to
-# eager otherwise). rccl is unaffected.
+# In eager mode both are valid; SIGNAL_PAD=1 keeps RCCL off the merge path
+# (the point of step1/step2). Set SIGNAL_PAD=1 for the intended symm-mem runs.
 SIGNAL_PAD="${SIGNAL_PAD:-0}"
-# CUDA-graph timing: 1 = graph replay (default, removes launch overhead),
-# 0 = eager (includes launch overhead).
+# CUDA-graph timing: DISABLED by default (0). Graph capture of the CPX path
+# currently produces incorrect (too-fast) timings and needs fixing later.
+# Eager (0) is the trusted path. Set CUDA_GRAPH=1 only for experimentation.
 CUDA_GRAPH="${CUDA_GRAPH:-1}"
 # Which physical GPU's devices to pin. SPX: one GPU index (default 0).
 # CPX: that GPU's 8 XCD indices (default 0-7). Override for a different GPU.
@@ -71,9 +83,7 @@ fi
 BENCH="${VLLM_SRC}/tests/kernels/attention/bench_starscream_attention.py"
 
 COMMON_ARGS=(
-    --total-q-heads "$Q_HEADS"
-    --total-kv-heads "$KV_HEADS"
-    --head-size "$HEAD_SIZE"
+    --model "$MODEL"
     --seq-lens "$SEQ_LENS"
     --token-offsets "$TOKEN_OFFSETS"
     --batch-sizes "$BATCH_SIZES"
@@ -81,6 +91,11 @@ COMMON_ARGS=(
     --iters "$ITERS"
     --csv "$CSV"
 )
+# Optional per-dimension overrides: only passed if the env var is set, so they
+# take precedence over the --model preset (the benchmark applies --model first).
+[[ -n "${Q_HEADS:-}" ]]   && COMMON_ARGS+=(--total-q-heads "$Q_HEADS")
+[[ -n "${KV_HEADS:-}" ]]  && COMMON_ARGS+=(--total-kv-heads "$KV_HEADS")
+[[ -n "${HEAD_SIZE:-}" ]] && COMMON_ARGS+=(--head-size "$HEAD_SIZE")
 if [[ "$CUDA_GRAPH" == "1" ]]; then
     COMMON_ARGS+=(--cuda-graph)
 else
@@ -90,12 +105,13 @@ fi
 echo "=================================================================="
 echo " Starscream attention benchmark (single physical GPU)"
 echo "   mode         : $MODE"
+echo "   model        : $MODEL"
 echo "   vllm src     : $VLLM_SRC"
 echo "   devices      : $DEVICES   (nproc=$NPROC)"
 echo "   seq_lens     : $SEQ_LENS"
 echo "   token_offsets: $TOKEN_OFFSETS"
 echo "   batch_sizes  : $BATCH_SIZES"
-echo "   q/kv heads   : $Q_HEADS / $KV_HEADS   head_size: $HEAD_SIZE"
+echo "   head override: q=${Q_HEADS:-preset} kv=${KV_HEADS:-preset} head_size=${HEAD_SIZE:-preset}"
 echo "   warmup/iters : $WARMUP / $ITERS"
 echo "   cuda_graph   : $CUDA_GRAPH   (1=graph replay, 0=eager)"
 echo "   signal_pad   : $SIGNAL_PAD   (CPX only)"
