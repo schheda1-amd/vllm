@@ -49,7 +49,7 @@ HEAD_SIZE="${HEAD_SIZE:-128}"
 CPX_SIZE="${CPX_SIZE:-8}"
 WARMUP="${WARMUP:-25}"
 ITERS="${ITERS:-200}"
-CSV="${CSV:-/workspace/bench_${MODE}.csv}"
+CSV="${CSV:-/workspace/vllm/bench_${MODE}.csv}"
 # On-device signal-pad barrier (1) vs host dist.barrier (0). Only affects CPX.
 # NOTE: CUDA-graph timing needs SIGNAL_PAD=1 for step1/step2 to be capturable
 # (a host dist.barrier is not graph-capturable; those variants fall back to
