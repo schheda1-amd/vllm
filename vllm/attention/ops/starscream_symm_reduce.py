@@ -57,8 +57,10 @@ from vllm.triton_utils import tl, triton
 #   * phase = *phase_ptr;  bank = phase & 1;  base = bank * WORLD_SIZE
 #   * arrive: atomic_add(+1) into slot `my_rank` of EVERY peer's pad in this
 #     bank, release+sys -> publishes our prior data store and announces arrival.
-#   * wait: spin until ALL WORLD_SIZE slots of MY OWN bank == WORLD_SIZE
-#     (every rank, including self, added 1), acquire+sys -> peers' data visible.
+#     Each rank touches only ITS OWN slot on all peers, so on any pad slot j is
+#     set exactly once (by rank j) and reaches 1 when rank j has arrived.
+#   * wait: spin until ALL WORLD_SIZE slots of MY OWN bank have reached 1
+#     (i.e. every rank arrived), acquire+sys -> peers' data visible.
 #   * reset: zero MY OWN bank's slots for reuse two barriers later, then store
 #     phase+1. Alternating banks guarantee a fast rank's next arrival lands in
 #     the OTHER bank, so it can't clobber a slot a slow rank is still reading,
@@ -81,20 +83,22 @@ def _signal_pad_barrier_kernel(
     phase = tl.load(phase_ptr)
     base = (phase % 2) * WORLD_SIZE
 
-    # --- arrive: +1 into slot `my_rank` of every peer's pad, this bank ---
+    # --- arrive: set slot `my_rank` to 1 on every peer's pad, this bank ---
+    # Each rank writes ONLY its own slot on all peers, so on any rank's pad each
+    # slot j is set exactly once (by rank j) and reaches 1 when rank j arrives.
     peer_base = tl.load(signal_peer_ptrs + peer, mask=mask, other=0)
     flag_ptr = peer_base.to(tl.pointer_type(tl.int32)) + base + my_rank
     tl.atomic_add(flag_ptr, 1, mask=mask, sem="release", scope="sys")
 
-    # --- wait: all WORLD_SIZE slots of my own bank == WORLD_SIZE ---
+    # --- wait: every slot of my own bank has reached 1 (all ranks arrived) ---
     my_base = tl.load(signal_peer_ptrs + my_rank).to(tl.pointer_type(tl.int32))
     slot_ptr = my_base + base + peer
     done = 0
     while done == 0:
         vals = tl.atomic_add(slot_ptr, 0, mask=mask, sem="acquire", scope="sys")
-        # masked-out lanes forced to WORLD_SIZE so they never gate the min.
-        minv = tl.min(tl.where(mask, vals, WORLD_SIZE))
-        done = (minv >= WORLD_SIZE).to(tl.int32)
+        # masked-out lanes forced to 1 (the threshold) so they never gate min.
+        minv = tl.min(tl.where(mask, vals, 1))
+        done = (minv >= 1).to(tl.int32)
 
     # --- reset my bank for reuse, and advance phase for the next call ---
     tl.store(slot_ptr, 0, mask=mask)
