@@ -354,12 +354,14 @@ def _bench_variant(mode, tn, grp, cpx, head_size, warmup, iters, use_graph):
 
 
 # Per-GPU attention shard shapes under TP=8 (single physical GPU focus).
-# Full-model heads / TP: Llama3 uses GQA with 8 KV heads, head_dim 128.
-#   Llama3-70B : 64 q-heads,  8 kv-heads -> /8 -> 8 q, 1 kv
-#   Llama3-405B: 128 q-heads, 8 kv-heads -> /8 -> 16 q, 1 kv
+# Full-model heads / TP (all GQA with 8 KV heads):
+#   Llama3-70B  : 64 q-heads,  8 kv-heads, head_dim 128 -> /8 -> 8 q,  1 kv, 128
+#   Llama3-405B : 128 q-heads, 8 kv-heads, head_dim 128 -> /8 -> 16 q, 1 kv, 128
+#   GPT-OSS-120B: 64 q-heads,  8 kv-heads, head_dim  64 -> /8 -> 8 q,  1 kv, 64
 _MODEL_CONFIGS = {
     "llama3-70b":  {"q_heads": 8,  "kv_heads": 1, "head_size": 128},
     "llama3-405b": {"q_heads": 16, "kv_heads": 1, "head_size": 128},
+    "gpt-oss-120b": {"q_heads": 8, "kv_heads": 1, "head_size": 64},
 }
 
 

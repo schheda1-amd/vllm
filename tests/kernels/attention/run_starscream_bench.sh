@@ -5,11 +5,12 @@
 # Launcher for the Starscream SPX-vs-CPX attention benchmark.
 #
 # Usage:
-#   ./run_starscream_bench.sh [spx|cpx] [model]   # mode defaults to spx
-#     model (optional): llama3-70b (default) | llama3-405b
+#   ./run_starscream_bench.sh [spx|cpx|cpx-baseline] [model]  # mode defaults spx
+#     model (optional): llama3-70b (default) | llama3-405b | gpt-oss-120b
 #       Sets the per-GPU TP=8 attention shard:
-#         llama3-70b  -> 8 q / 1 kv / head_size 128
-#         llama3-405b -> 16 q / 1 kv / head_size 128
+#         llama3-70b   -> 8 q  / 1 kv / head_size 128
+#         llama3-405b  -> 16 q / 1 kv / head_size 128
+#         gpt-oss-120b -> 8 q  / 1 kv / head_size 64
 #       An explicit Q_HEADS/KV_HEADS/HEAD_SIZE env still overrides everything.
 #
 # The HARDWARE compute-partition mode must already match the requested mode:
@@ -54,8 +55,10 @@ fi
 # Model preset: arg 2 (if given) else $MODEL else llama3-70b.
 MODEL="${2:-${MODEL:-llama3-70b}}"
 MODEL="$(echo "$MODEL" | tr '[:upper:]' '[:lower:]')"
-if [[ "$MODEL" != "llama3-70b" && "$MODEL" != "llama3-405b" ]]; then
-    echo "ERROR: model must be 'llama3-70b' or 'llama3-405b' (got '$MODEL')" >&2
+if [[ "$MODEL" != "llama3-70b" && "$MODEL" != "llama3-405b" \
+      && "$MODEL" != "gpt-oss-120b" ]]; then
+    echo "ERROR: model must be 'llama3-70b', 'llama3-405b', or 'gpt-oss-120b'"\
+         "(got '$MODEL')" >&2
     exit 1
 fi
 
