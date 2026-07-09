@@ -123,6 +123,32 @@ def _all_reduce_min_int(val: int) -> int:
     return int(t.item())
 
 
+def _trapezoidal_per_token(offsets, lats):
+    """Per-output-token attention latency via trapezoidal integration.
+
+    `offsets` are output-token offsets (sorted ascending), `lats` the measured
+    decode-step latency (us) at each. Decode attention cost is ~linear in
+    context, so we integrate latency over the offset span and divide by that
+    span -- an average that is unbiased for non-uniform offset spacing (unlike a
+    plain mean, which over-weights whichever region is sampled more densely).
+
+    Single point -> that point (nothing to integrate). Any NaN (a SKIP(OOM)
+    among the offsets) -> NaN, since the curve is incomplete.
+    """
+    pts = [(o, l) for o, l in zip(offsets, lats)]
+    if any(l != l for _, l in pts):  # NaN present
+        return float("nan")
+    if len(pts) == 1:
+        return pts[0][1]
+    span = pts[-1][0] - pts[0][0]
+    if span == 0:
+        return sum(l for _, l in pts) / len(pts)
+    area = 0.0
+    for (o0, l0), (o1, l1) in zip(pts[:-1], pts[1:]):
+        area += 0.5 * (l0 + l1) * (o1 - o0)
+    return area / span
+
+
 def _set_variant_env(variant: str) -> None:
     """Toggle the merge implementation via env flags (read fresh each call)."""
     if variant == "rccl":
@@ -224,8 +250,13 @@ def _attention_call(mode, tn, grp, cpx, head_size):
         )
 
 
-def _bench_variant(mode, tn, grp, cpx, head_size, warmup, iters):
-    """Median per-iter latency (us) for this rank, then MAX across ranks."""
+def _bench_variant_eager(mode, tn, grp, cpx, head_size, warmup, iters):
+    """Eager-mode timing. Median per-iter latency (us), then MAX across ranks.
+
+    NOTE: each timed iteration includes host-side kernel-launch overhead. For
+    microsecond-scale decode ops this can dominate and distort the cross-variant
+    comparison; prefer the CUDA-graph path when capturable.
+    """
     for _ in range(warmup):
         _attention_call(mode, tn, grp, cpx, head_size)
     torch.cuda.synchronize()
@@ -247,6 +278,67 @@ def _bench_variant(mode, tn, grp, cpx, head_size, warmup, iters):
     return _all_reduce_max(median_us)  # slowest XCD = critical path
 
 
+def _bench_variant_graph(mode, tn, grp, cpx, head_size, warmup, iters):
+    """CUDA-graph timing. Captures one attention call, times `iters` replays.
+
+    Removes host launch overhead from the measurement so the numbers reflect
+    real GPU/comm cost — the axis the SPX-vs-CPX / rccl-vs-step1-vs-step2
+    comparison rests on. Raises if the region is not capturable (e.g. a variant
+    that still uses a host dist.barrier); the caller falls back to eager.
+
+    Returns per-iter latency (us) as the timed replay block / iters, MAX over
+    ranks. Graph replay is deterministic, so a block average is stable (no need
+    for per-iter medians) and, crucially, carries zero inter-iter host sync.
+    """
+    call = lambda: _attention_call(mode, tn, grp, cpx, head_size)
+
+    # Warmup on a side stream (required by torch before graph capture) — this
+    # also settles Triton JIT and NCCL/symm-mem setup so capture is clean.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            call()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    # Capture. If the region contains an uncapturable op (host dist.barrier),
+    # this raises and the caller falls back to eager.
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        call()
+
+    # Warmup replays (excluded from timing).
+    for _ in range(warmup):
+        g.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Time a block of `iters` replays with no host sync in between.
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        g.replay()
+    end.record()
+    torch.cuda.synchronize()
+
+    per_iter_us = (start.elapsed_time(end) / iters) * 1000.0
+    return _all_reduce_max(per_iter_us)  # slowest XCD = critical path
+
+
+def _bench_variant(mode, tn, grp, cpx, head_size, warmup, iters, use_graph):
+    """Dispatch to graph or eager timing, with graph->eager fallback."""
+    if use_graph:
+        try:
+            return _bench_variant_graph(
+                mode, tn, grp, cpx, head_size, warmup, iters)
+        except Exception as e:  # noqa: BLE001 - capture may fail on ROCm/barrier
+            _log(f"    [graph capture failed, falling back to eager: "
+                 f"{type(e).__name__}: {e}]")
+    return _bench_variant_eager(mode, tn, grp, cpx, head_size, warmup, iters)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["spx", "cpx"], required=True)
@@ -262,11 +354,30 @@ def main():
                         "TP=8 -> 8/8 = 1 kv-head per GPU.")
     p.add_argument("--head-size", type=int, default=128)
     p.add_argument("--block-size", type=int, default=16)
-    p.add_argument("--seq-lens", type=str, default="256,8192,131072")
+    p.add_argument("--seq-lens", type=str, default="256,8192,131072",
+                   help="Base context lengths (KV cache size at the START of "
+                        "generation, ~= input tokens).")
+    p.add_argument("--token-offsets", type=str, default="0",
+                   help="Output-token offsets applied to each base seq-len. "
+                        "For base S and offset o, we measure a decode step at "
+                        "context S+o, i.e. the cost of generating output token "
+                        "o+1. E.g. '0,64,128,192,256' samples the first 257 "
+                        "output tokens. The per-output-token attention latency "
+                        "is the trapezoidal integral over these offsets divided "
+                        "by the span, emitted as `pertoken` rows. Default '0' "
+                        "reproduces the single-snapshot behavior.")
     p.add_argument("--batch-sizes", type=str,
                    default="1,8,32,64,128,256,512,1024")
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=50)
+    p.add_argument("--warmup", type=int, default=25)
+    p.add_argument("--iters", type=int, default=200)
+    p.add_argument("--cuda-graph", dest="cuda_graph", action="store_true",
+                   default=True,
+                   help="Time via CUDA graph replay (default). Removes host "
+                        "launch overhead. Falls back to eager per-variant if "
+                        "capture fails (e.g. a host dist.barrier in the path -- "
+                        "use SIGNAL_PAD=1 so step1/step2 stay capturable).")
+    p.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_false",
+                   help="Force eager-mode timing (includes launch overhead).")
     p.add_argument("--csv", type=str, default="",
                    help="Optional path to write CSV results (rank 0)")
     p.add_argument("--skip-sanity", action="store_true",
@@ -298,7 +409,11 @@ def main():
         _log(f"  cpx_size (XCDs/GPU)    : {cpx}   -> {num_physical} DCP groups")
     _log(f"  total q-heads / kv-heads: {args.total_q_heads} / {args.total_kv_heads}")
     _log(f"  head_size / block_size : {args.head_size} / {args.block_size}")
-    _log(f"  warmup / iters         : {args.warmup} / {args.iters}  (median, MAX over ranks)")
+    _log(f"  warmup / iters         : {args.warmup} / {args.iters}  (MAX over ranks)")
+    _log(f"  timing mode            : {'CUDA graph replay' if args.cuda_graph else 'eager'}")
+    _log(f"  token offsets          : {args.token_offsets}")
+    _log(f"  reported latency       : per decode step; raw = one output token "
+         f"at context base+offset")
     _log("=" * 100)
 
     # Per-device head counts. In CPX these are the GATHERED per-XCD heads
@@ -323,6 +438,7 @@ def main():
     device = torch.device(f"cuda:{_local_rank}")
 
     seq_lens = [int(x) for x in args.seq_lens.split(",")]
+    token_offsets = sorted(int(x) for x in args.token_offsets.split(","))
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     variants = ["rccl", "step1", "step2"] if args.mode == "cpx" else ["spx"]
 
@@ -350,59 +466,115 @@ def main():
             if args.mode == "cpx":
                 _set_variant_env(v)
             us = _bench_variant(args.mode, tn, grp, cpx, args.head_size,
-                                max(1, args.warmup // 2), max(2, args.iters // 5))
+                                max(1, args.warmup // 2), max(2, args.iters // 5),
+                                args.cuda_graph)
             _log(f"[sanity]   {v:>6}: {us:.2f} us")
         del tn
         torch.cuda.empty_cache()
         _log("[sanity] OK -- harness works; starting full sweep.\n")
 
-    # Table header
+    multi_offset = token_offsets != [0]
+
+    # Table header. With multiple offsets we print the actual context (base+off)
+    # and the output-token index (offset+1) so each row is self-describing.
     var_cols = "".join(f"{v + '_us':>14}" for v in variants)
-    _log(f"{'seq_len':>9} {'batch':>7}{var_cols}   scenario")
-    _log("-" * 100)
+    if multi_offset:
+        _log(f"{'baseS':>8} {'ctx':>9} {'tok#':>6} {'batch':>7}{var_cols}   scenario")
+    else:
+        _log(f"{'seq_len':>9} {'batch':>7}{var_cols}   scenario")
+    _log("-" * 110)
 
-    csv_rows = []  # (mode, seq_len, batch, variant, us)  or  us=NaN for SKIP
+    # raw rows:      (mode, base_seq_len, offset, context, batch, variant, us)
+    # pertoken rows: (mode, base_seq_len, batch, variant, per_token_us)
+    raw_rows = []
+    # points[(base_S, B, v)] = list of (offset, us) for trapezoidal aggregation
+    points: dict = {}
 
-    for S in seq_lens:
-        scen = _SCENARIO_BY_SEQLEN.get(S, "")
-        for B in batch_sizes:
-            ok, tn = _try_alloc(args.mode, B, S, qh_dev, kvh, args.head_size,
-                                args.block_size, cpx, device)
-            ok_all = _all_reduce_min_int(1 if ok else 0)
-            if not ok_all:
-                if ok:  # this rank allocated but a peer OOM'd -- free it
-                    del tn
-                    torch.cuda.empty_cache()
-                skip_cols = "".join(f"{'SKIP(OOM)':>14}" for _ in variants)
-                _log(f"{S:>9} {B:>7}{skip_cols}   {scen}")
+    for base_S in seq_lens:
+        scen = _SCENARIO_BY_SEQLEN.get(base_S, "")
+        for off in token_offsets:
+            S = base_S + off               # context at this output token
+            tok_idx = off + 1              # 1-based output-token index
+            for B in batch_sizes:
+                ok, tn = _try_alloc(args.mode, B, S, qh_dev, kvh,
+                                    args.head_size, args.block_size, cpx, device)
+                ok_all = _all_reduce_min_int(1 if ok else 0)
+                if not ok_all:
+                    if ok:  # this rank allocated but a peer OOM'd -- free it
+                        del tn
+                        torch.cuda.empty_cache()
+                    skip_cols = "".join(f"{'SKIP(OOM)':>14}" for _ in variants)
+                    if multi_offset:
+                        _log(f"{base_S:>8} {S:>9} {tok_idx:>6} {B:>7}"
+                             f"{skip_cols}   {scen}")
+                    else:
+                        _log(f"{S:>9} {B:>7}{skip_cols}   {scen}")
+                    for v in variants:
+                        raw_rows.append(
+                            (args.mode, base_S, off, S, B, v, float("nan")))
+                        points.setdefault((base_S, B, v), []).append(
+                            (off, float("nan")))
+                    continue
+
+                results = {}
                 for v in variants:
-                    csv_rows.append((args.mode, S, B, v, float("nan")))
-                continue
+                    if args.mode == "cpx":
+                        _set_variant_env(v)
+                    us = _bench_variant(args.mode, tn, grp, cpx, args.head_size,
+                                        args.warmup, args.iters, args.cuda_graph)
+                    results[v] = us
+                    raw_rows.append((args.mode, base_S, off, S, B, v, us))
+                    points.setdefault((base_S, B, v), []).append((off, us))
 
-            results = {}
-            for v in variants:
-                if args.mode == "cpx":
-                    _set_variant_env(v)
-                us = _bench_variant(args.mode, tn, grp, cpx, args.head_size,
-                                    args.warmup, args.iters)
-                results[v] = us
-                csv_rows.append((args.mode, S, B, v, us))
+                val_cols = "".join(f"{results[v]:>14.2f}" for v in variants)
+                if multi_offset:
+                    _log(f"{base_S:>8} {S:>9} {tok_idx:>6} {B:>7}"
+                         f"{val_cols}   {scen}")
+                else:
+                    _log(f"{S:>9} {B:>7}{val_cols}   {scen}")
 
-            val_cols = "".join(f"{results[v]:>14.2f}" for v in variants)
-            _log(f"{S:>9} {B:>7}{val_cols}   {scen}")
+                del tn
+                torch.cuda.empty_cache()
 
-            del tn
-            torch.cuda.empty_cache()
+    # --- Per-output-token attention latency (trapezoidal over offsets) ---
+    pertoken_rows = []
+    if multi_offset:
+        _log("-" * 110)
+        _log("Per-output-token attention latency (est., trapezoidal over "
+             f"offsets {token_offsets}); ATTENTION ONLY, not full TPOT:")
+        ptk_cols = "".join(f"{v + '_us':>14}" for v in variants)
+        _log(f"{'baseS':>8} {'batch':>7}{ptk_cols}   scenario")
+        for base_S in seq_lens:
+            scen = _SCENARIO_BY_SEQLEN.get(base_S, "")
+            for B in batch_sizes:
+                cells = []
+                for v in variants:
+                    pts = sorted(points.get((base_S, B, v), []))
+                    offs = [o for o, _ in pts]
+                    lats = [l for _, l in pts]
+                    ptk = _trapezoidal_per_token(offs, lats)
+                    pertoken_rows.append((args.mode, base_S, B, v, ptk))
+                    cells.append(ptk)
+                cell_str = "".join(
+                    ("SKIP(OOM)".rjust(14) if c != c else f"{c:>14.2f}")
+                    for c in cells)
+                _log(f"{base_S:>8} {B:>7}{cell_str}   {scen}")
 
-    _log("=" * 100)
+    _log("=" * 110)
 
-    # CSV output (rank 0)
+    # CSV output (rank 0). Long format with a row_type column so raw curve and
+    # derived per-token scalar live in one file, ready for plotting.
     if args.csv and _rank == 0:
         with open(args.csv, "w") as f:
-            f.write("mode,seq_len,batch,variant,latency_us\n")
-            for mode, S, B, v, us in csv_rows:
+            f.write("mode,row_type,base_seq_len,offset,context,batch,"
+                    "variant,latency_us\n")
+            for mode, base_S, off, S, B, v, us in raw_rows:
                 us_str = "" if us != us else f"{us:.4f}"  # NaN -> empty
-                f.write(f"{mode},{S},{B},{v},{us_str}\n")
+                f.write(f"{mode},raw,{base_S},{off},{S},{B},{v},{us_str}\n")
+            for mode, base_S, B, v, us in pertoken_rows:
+                us_str = "" if us != us else f"{us:.4f}"
+                # per-token rows aggregate over offsets -> offset/context blank
+                f.write(f"{mode},pertoken,{base_S},,,{B},{v},{us_str}\n")
         _log(f"CSV written to {args.csv}")
     _log("")
 
