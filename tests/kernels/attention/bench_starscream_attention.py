@@ -252,10 +252,14 @@ def main():
     p.add_argument("--mode", choices=["spx", "cpx"], required=True)
     p.add_argument("--cpx-size", type=int, default=8,
                    help="XCDs per physical GPU (CPX mode)")
-    p.add_argument("--total-q-heads", type=int, default=128,
-                   help="Total query heads across the model (DeepSeek-R1: 128)")
-    p.add_argument("--total-kv-heads", type=int, default=128,
-                   help="Total KV heads across the model")
+    p.add_argument("--total-q-heads", type=int, default=8,
+                   help="Query heads visible to this benchmark's device set. "
+                        "Single-GPU focus: Llama3-70B under TP=8 -> 64/8 = 8 "
+                        "q-heads per GPU. (Divided by num_physical internally, "
+                        "which is 1 in the single-GPU setup.)")
+    p.add_argument("--total-kv-heads", type=int, default=1,
+                   help="KV heads for this device set. Llama3-70B GQA under "
+                        "TP=8 -> 8/8 = 1 kv-head per GPU.")
     p.add_argument("--head-size", type=int, default=128)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--seq-lens", type=str, default="256,8192,131072")

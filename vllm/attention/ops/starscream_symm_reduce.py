@@ -39,6 +39,95 @@ from vllm.triton_utils import tl, triton
 
 
 # ---------------------------------------------------------------------------
+# On-device signal-pad barrier (RCCL-free replacement for dist.barrier)
+# ---------------------------------------------------------------------------
+# Correctness model (all-to-all, monotonic generation):
+#   * Each rank owns an int32 signal pad of WORLD_SIZE slots. Slot j on rank
+#     r's pad = "rank j has signalled rank r at generation >= that value".
+#   * `gen` strictly increases per barrier and is the SAME on every rank (the
+#     barrier is collective). We compare with `>=`, never resetting to 0, so a
+#     fast rank entering gen+1 can only raise a slot, never clobber a value a
+#     slow rank still needs -> no reset race.
+#   * arrive : xchg gen into slot `rank` of EVERY peer's pad, release+sys, so
+#     the prior data write (buf.copy_) is published before the flag.
+#   * wait   : spin until EVERY slot of MY OWN pad is >= gen, acquire+sys, so
+#     once satisfied the peers' data writes are visible to my later reads.
+#   * sys scope: XCDs are distinct devices under CPX, so ordering must be
+#     system-wide, not just device-wide.
+#   * Launched single-program, single-warp: lane 0 does arrive-then-wait, no
+#     divergent intra-wave spin, no inter-CTA co-residency requirement ->
+#     deadlock-free.
+@triton.jit
+def _signal_pad_barrier_kernel(
+    signal_peer_ptrs,   # [W] int64 base pointers of every rank's signal pad
+    my_rank,            # this rank's index in the group
+    gen,                # generation stamp (>0), identical across ranks
+    WORLD_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,  # next_pow2(WORLD_SIZE), lane block for the W peers
+):
+    # Single program, single warp. Peer p is handled by lane p (masked to W).
+    peer = tl.arange(0, BLOCK)
+    mask = peer < WORLD_SIZE
+
+    # --- arrive: stamp `gen` into slot `my_rank` on EVERY peer's pad ---
+    # One vectorized scatter. release+sys so our preceding data store
+    # (buf.copy_) is globally visible before the flag it publishes.
+    peer_base = tl.load(signal_peer_ptrs + peer, mask=mask, other=0)
+    flag_ptr = peer_base.to(tl.pointer_type(tl.int32)) + my_rank
+    tl.atomic_xchg(flag_ptr, gen, mask=mask, sem="release", scope="sys")
+
+    # --- wait: spin until EVERY slot on MY OWN pad has reached `gen` ---
+    # acquire+sys so peers' data stores are visible once we proceed. Masked-out
+    # lanes are forced to `gen` so they never hold up the min-reduction.
+    my_base = tl.load(signal_peer_ptrs + my_rank).to(tl.pointer_type(tl.int32))
+    slot_ptr = my_base + peer
+    done = 0
+    while done == 0:
+        # atomic_add(...,0) is an acquire load.
+        vals = tl.atomic_add(slot_ptr, 0, mask=mask, sem="acquire", scope="sys")
+        minv = tl.min(tl.where(mask, vals, gen))
+        done = (minv >= gen).to(tl.int32)
+
+
+def signal_pad_barrier(buf) -> None:
+    """On-device barrier over the group via a symm-mem signal pad.
+
+    Replaces ``dist.barrier`` (an RCCL collective) with a single-warp Triton
+    kernel that arrives/waits through symmetric-memory peer pointers, keeping
+    RCCL out of the merge critical path. ``buf`` is a SymmMemAllGatherBuffer.
+    """
+    gen = buf.next_gen()
+    _signal_pad_barrier_kernel[(1,)](
+        signal_peer_ptrs=buf.signal_peer_ptrs,
+        my_rank=buf.rank_in_group,
+        gen=gen,
+        WORLD_SIZE=buf.world_size,
+        BLOCK=triton.next_power_of_2(buf.world_size),
+        num_warps=1,
+    )
+
+
+def _barrier(group, buf) -> None:
+    """Bracket barrier for the symm-mem allgather.
+
+    Dispatches to the on-device signal-pad barrier when
+    VLLM_STARSCREAM_SIGNAL_PAD_BARRIER is set (keeps RCCL off the critical
+    path), else the host dist.barrier. Both give the same happens-before
+    guarantee around the peer copy/read.
+    """
+    import vllm.envs as envs
+
+    from vllm.distributed.device_communicators.symm_mem_allgather import (
+        symm_mem_barrier,
+    )
+
+    if envs.VLLM_STARSCREAM_SIGNAL_PAD_BARRIER:
+        signal_pad_barrier(buf)
+    else:
+        symm_mem_barrier(group)
+
+
+# ---------------------------------------------------------------------------
 # Step 1: symmetric-memory allgather (drop-in for get_dcp_group().all_gather)
 # ---------------------------------------------------------------------------
 @triton.jit
@@ -80,7 +169,6 @@ def symm_mem_all_gather(meta: torch.Tensor) -> torch.Tensor:
     """
     from vllm.distributed.device_communicators.symm_mem_allgather import (
         get_symm_mem_allgather_manager,
-        symm_mem_barrier,
     )
     from vllm.distributed.parallel_state import get_dcp_group
 
@@ -98,7 +186,7 @@ def symm_mem_all_gather(meta: torch.Tensor) -> torch.Tensor:
     buf = mgr.get_buffer(numel, meta.dtype)
     # Publish this rank's shard into its symm-mem staging buffer.
     buf.buffer[:numel].copy_(meta.reshape(-1))
-    symm_mem_barrier(group)
+    _barrier(group, buf)
 
     out = torch.empty((T, H, cpx, dext), dtype=meta.dtype, device=meta.device)
     num_rows = T * H
@@ -112,7 +200,7 @@ def symm_mem_all_gather(meta: torch.Tensor) -> torch.Tensor:
         BLOCK_D=block_d,
     )
     # Ensure no peer frees/overwrites its staging buffer before reads complete.
-    symm_mem_barrier(group)
+    _barrier(group, buf)
     return out
 
 
@@ -206,7 +294,6 @@ def fused_all_gather_reduce_segments(
     """
     from vllm.distributed.device_communicators.symm_mem_allgather import (
         get_symm_mem_allgather_manager,
-        symm_mem_barrier,
     )
     from vllm.distributed.parallel_state import get_dcp_group
 
@@ -226,7 +313,7 @@ def fused_all_gather_reduce_segments(
 
     buf = mgr.get_buffer(numel, starscream_meta_out.dtype)
     buf.buffer[:numel].copy_(starscream_meta_out.reshape(-1))
-    symm_mem_barrier(group)
+    _barrier(group, buf)
 
     use_fp8 = output_scale is not None
     fp8_min = float8_info.min if float8_info is not None else 0.0
@@ -249,5 +336,5 @@ def fused_all_gather_reduce_segments(
         FP8_MAX=fp8_max,
     )
     # Guard peer staging buffers until every rank has finished reading.
-    symm_mem_barrier(group)
+    _barrier(group, buf)
     return True

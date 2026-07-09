@@ -210,32 +210,65 @@ All parameters:
 3. Peer-pointer deref idiom used: `tl.load(peer_ptrs + p).to(tl.pointer_type(
    tl.float32))`, exactly as in the reference GEMM+AG kernels.
 
-## Sync model — current and next step
+## Sync model — two barrier implementations (flag-selectable)
 
-**Current:** the symm-mem allgather is bracketed by
-`dist.barrier(group.device_group)` (host-side) — before reads (so every peer has
-published its shard) and after (so no peer frees/overwrites its staging buffer
-mid-read). This is a **control-plane sync only**; the payload movement is pure
-symm-mem + Triton and never touches RCCL, so the "replace the RCCL allgather"
-requirement is satisfied.
+The symm-mem allgather (step1) and fused kernel (step2) are each bracketed by two
+barriers: one *before* the peer reads (every peer has published its shard) and
+one *after* (no peer overwrites its staging buffer before others finish reading).
+A single dispatch helper `_barrier(group, buf)` in `starscream_symm_reduce.py`
+selects the implementation:
 
-**Next step (only if the current fused path works out):** replace the host
-`dist.barrier` with an **on-device signal-pad barrier** using the symmetric
-memory handle's `signal_pad_ptrs`. This removes the host round-trip from the
-critical path and enables a truly single-launch device-side handshake:
+**Default — host `dist.barrier`** (`VLLM_STARSCREAM_SIGNAL_PAD_BARRIER=0`).
+`dist.barrier(group.device_group)`. Correctness-safe and simple, BUT
+`dist.barrier` is *itself an RCCL collective*. So this path replaces one RCCL
+all_gather (which fuses data movement + sync) with a symm-mem copy + **two** RCCL
+barriers. That fixed 2-collective latency dominates on small messages and is why,
+in the first perf run, symm-mem lost to baseline on small batches and only won on
+large ones (batch>=128, seq=8192) — the exact inversion of the expected profile.
 
-- The rendezvous handle exposes `signal_pad_ptrs` (per-peer signal buffers)
-  alongside `buffer_ptrs`. Expose them the same way (`torch.tensor(...,
-  dtype=torch.int64, device=...)`) in `SymmMemAllGatherBuffer`.
-- In the fused kernel, before reading peer numerators/L/M, each program does an
-  arrive-and-wait on the signal pad: atomically bump the local slot on every
-  peer, then spin until all peers' slots for this generation are set. This is
-  the standard symm-mem device barrier pattern (see the ring/prefetch variants
-  under `~/symmetric-memory/` for reference, e.g. `gemm+ag_symm_ring.py`).
-- Keep it flag-selectable (e.g. a third mode or a
-  `VLLM_STARSCREAM_SIGNAL_PAD_BARRIER` flag) so the host-barrier path remains a
-  fallback for correctness triage.
+**Fast — on-device signal-pad barrier** (`VLLM_STARSCREAM_SIGNAL_PAD_BARRIER=1`).
+Replaces `dist.barrier` with a single-warp Triton kernel
+(`_signal_pad_barrier_kernel`) that arrives/waits through symmetric-memory peer
+pointers — no RCCL, no host round-trip. This is what should restore the expected
+"symm-mem wins the small/latency-bound cases" profile.
 
-Rationale for deferring: the host barrier is simpler and correctness-safe; get
-functional + output parity + a perf baseline with it first. If the barrier shows
-up as a cost in the perf runs, the signal-pad barrier is the fix.
+Algorithm (all-to-all, monotonic generation):
+- Each rank owns an int32 signal pad of `world_size` slots (a second symm-mem
+  allocation in `SymmMemAllGatherBuffer`, with `signal_peer_ptrs`).
+- A per-buffer generation counter `_gen`, incremented each barrier (`next_gen()`).
+  Because barriers are collective, every rank passes the same `gen`.
+- **arrive:** vectorized `atomic_xchg(gen, release, sys)` into slot `my_rank` of
+  every peer's pad.
+- **wait:** spin on `atomic_add(...,0, acquire, sys)` over my own pad until the
+  min across slots `>= gen`.
+- `>=` compare + never resetting to 0 avoids the classic barrier reset race; a
+  fast rank entering `gen+1` can only raise a slot, never starve a slow rank.
+- One-time cold-path `dist.barrier` after zeroing the pad at allocation, so no
+  peer arrives before all pads are zeroed.
+
+### HARDWARE VALIDATION REQUIRED (MI300/CDNA, ROCm)
+
+The signal-pad barrier's correctness hinges on Triton lowering `sem="release"/
+"acquire"` with `scope="sys"` to **true system-scope** acquire/release across
+XCDs. If the ROCm Triton build silently narrows `scope="sys"` to device scope,
+cross-XCD data visibility is not guaranteed and you can get stale peer reads under
+load. VALIDATE by running the correctness test with the flag ON before trusting
+any perf number:
+
+```bash
+PYTHONPATH=/workspace/vllm \
+TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
+VLLM_STARSCREAM_SIGNAL_PAD_BARRIER=1 \
+torchrun --nnodes=1 --nproc-per-node=8 \
+  /workspace/vllm/tests/kernels/attention/test_starscream_symm_reduce.py \
+  --mode all --cpx-size 8 --num-tokens 32 --num-heads 64 --head-size 128 --seq-len 4096
+```
+
+Step 1 must still show `0.00e+00` and step 2 ULP-only diffs. A hang = the wait
+never observing arrive (scope/ordering issue); wrong output = visibility issue.
+
+### Possible further speedups (measure first)
+- Fold arrive into the producer copy and wait into the consumer kernel, removing
+  the separate barrier launch entirely (true in-kernel handshake). Bigger change.
+- Drop the trailing (post-read) barrier: the next call's publish + its
+  pre-barrier may already order buffer reuse. A/B once the basic version passes.

@@ -1,16 +1,23 @@
 # Starscream attention performance benchmark (SPX vs CPX+NPS4)
 
-Benchmarks decode-attention wall-clock for DeepSeek-R1-style shapes on AMD
-Instinct GPUs, comparing two hardware compute-partition modes and, within CPX,
-three cross-XCD merge implementations. Context for a fresh session picking this
-up on the remote node.
+Benchmarks decode-attention wall-clock for **Llama3-70B (TP=8)** on AMD Instinct,
+comparing **a single physical GPU** in two compute-partition modes and, within
+CPX, three cross-XCD merge implementations. Context for a fresh session picking
+this up on the remote node.
 
-## What is being compared
+## Focus: ONE physical GPU
 
-| Mode | Devices | Attention per device | Cross-XCD merge |
-|------|---------|----------------------|-----------------|
-| **SPX** | 8 physical GPUs | over the **full** context | none |
-| **CPX+NPS4** | 64 vGPUs (8 XCDs/GPU) | over **1/cpx** of the context | yes — 3 variants |
+The primary comparison is a **single physical GPU's attention shard**:
+
+| Mode | Devices used | Attention per device | Cross-XCD merge |
+|------|--------------|----------------------|-----------------|
+| **SPX** | 1 physical GPU (1 rank) | over the **full** context | none |
+| **CPX+NPS4** | that same GPU as 8 XCDs (8 ranks) | over **1/cpx** of the context | yes — 3 variants |
+
+We are NOT sweeping the whole node. SPX runs 1 rank on GPU 0; CPX runs 8 ranks on
+GPU 0's 8 XCDs (`CUDA_VISIBLE_DEVICES=0` vs `0..7`). The question: can the same
+silicon, subdivided into 8 XCDs, beat its own SPX attention latency once the
+cross-XCD merge is done via symmetric memory instead of RCCL?
 
 CPX merge variants (toggled by env flag, benchmarked back-to-back per cell):
 
@@ -20,21 +27,48 @@ CPX merge variants (toggled by env flag, benchmarked back-to-back per cell):
 | `step1` | symmetric-memory allgather → `reduce_segments` (collective swap) |
 | `step2` | fused symmetric-memory allgather + reduce (single kernel) |
 
+The signal-pad barrier (`VLLM_STARSCREAM_SIGNAL_PAD_BARRIER=1`, see the impl
+README) applies to step1/step2 and removes RCCL from the merge sync path; toggle
+it via `SIGNAL_PAD=1` on the launcher.
+
 **Thesis.** CPX partitioning cuts per-XCD attention compute ~cpx×, but makes the
 intra-GPU cross-XCD communication explicit. RCCL is a poor fit for that
 intra-physical-GPU peer traffic and can bottleneck. Symmetric memory
-(step1/step2) gives CPX a performant merge so CPX stays competitive with — or
-beats — SPX on end-to-end attention. The benchmark quantifies this across
-workload shapes.
+(step1/step2, ideally with the signal-pad barrier) gives CPX a performant merge
+so the GPU in CPX mode stays competitive with — or beats — the same GPU in SPX on
+decode attention. The benchmark quantifies this across workload shapes.
+
+## Model shape: Llama3-70B under TP=8, one GPU
+
+Llama3-70B: 64 q-heads, 8 kv-heads (GQA), head_dim 128. Under TP=8 each GPU owns:
+
+| Param | Whole model | Per GPU (TP=8) |
+|-------|-------------|----------------|
+| q-heads | 64 | **8** |
+| kv-heads | 8 | **1** |
+| head_size | 128 | 128 |
+
+So one GPU runs GQA with **8 q-heads sharing 1 kv-head** — the defaults
+(`--total-q-heads 8 --total-kv-heads 1 --head-size 128`). This is exactly the
+Starscream regime: `kv-heads (1) < cpx (8)`, so in CPX the single KV head would
+otherwise be replicated across all 8 XCDs; Starscream splits its context instead.
+
+Decode GEMM shapes on that GPU (batch B, context S), for reference:
+* **SPX:** QKᵀ `[8,128]×[128,S]→[8,S]`; P·V `[8,S]×[S,128]→[8,128]`.
+* **CPX (per XCD):** query all-gathered to 8 q-heads, context split 8×:
+  QKᵀ `[8,128]×[128,S/8]→[8,S/8]`; P·V `[8,S/8]×[S/8,128]→[8,128]` partial →
+  merge across 8 XCDs → each XCD outputs `[B,1,128]`. The S dimension is cut 8×
+  per XCD and the 8 XCDs run concurrently.
 
 ## What is measured (and what is NOT)
 
 * **Measured:** wall-clock of a single **decode** attention step — start to end
   of the attention op. In CPX this includes the query-head all-gather (RCCL,
   constant across merge variants), the per-XCD partial attention, and the merge.
-* **Reduction across ranks:** `MAX` — the slowest XCD is the critical path that
-  gates its physical GPU. Each rank reports the median over `--iters` timed
-  runs (after `--warmup`); the harness takes the max across all ranks.
+* **Reduction across ranks:** `MAX` — in CPX the slowest XCD is the critical path
+  that gates the physical GPU. Each rank reports the median over `--iters` timed
+  runs (after `--warmup`); the harness takes the max across ranks. In SPX there
+  is one rank, so max is trivially that rank.
 * **Decode only.** Every sequence contributes exactly one query token
   (`max_seqlen_q = 1`). This is deliberate: the Starscream cross-XCD path is a
   **decode** path — prefill (`max_seqlen_q > 1`) uses a different branch and is
@@ -43,32 +77,22 @@ workload shapes.
   those ratios are dominated by.
 * **NOT measured:** prefill attention, MoE/FFN layers, end-to-end model latency,
   throughput/tokens-per-second. This is an attention-kernel microbenchmark of
-  the decode step only.
+  the decode step only, on a single physical GPU.
 
 ## Parameters and shapes
 
-* **Head counts come from the MODEL CONFIG, not the workload table.** The
-  workload table only gives sequence shapes (input/output tokens, prefill:decode
-  ratio) → these map to `--seq-lens` / `--batch-sizes`. Head counts, head size,
-  and KV-head count are DeepSeek-R1 *architecture* parameters →
-  `--total-q-heads` / `--total-kv-heads` / `--head-size`. The `128/128/128`
-  defaults are placeholders.
-* **KV-heads caveat (important).** DeepSeek-R1 uses MLA (Multi-head Latent
-  Attention): KV is a compressed latent, not N discrete KV heads, so there is no
-  clean `num_key_value_heads`. Moreover vLLM routes MLA models through a separate
-  MLA attention backend, not the `triton_unified_attention` path where Starscream
-  lives. Consequences:
-    * This benchmark is a **synthetic characterization** of the Starscream merge
-      at representative shapes — not a measurement of DeepSeek-R1's real
-      attention backend.
-    * **Relative results are robust** (SPX vs CPX vs rccl/step1/step2 trends hold
-      regardless of the exact head count — the thesis).
-    * **Absolute microseconds are not** — they scale with the head config. For
-      absolute fidelity, get `num_attention_heads`, `num_key_value_heads` (or the
-      MLA qk/v head dims), and `head_dim` from the target model config and pass
-      them in.
-* Per-device head counts are derived: in CPX the gathered per-XCD query heads =
-  `total_q_heads / num_physical_gpus`, and local heads = gathered / cpx.
+* **Head counts = model config (Llama3-70B, TP=8), NOT the workload table.** The
+  workload table only gives sequence shapes → `--seq-lens` / `--batch-sizes`.
+  Head counts come from the architecture → `--total-q-heads 8 --total-kv-heads 1
+  --head-size 128` (the single-GPU TP=8 shard; these are the defaults). Because
+  the benchmark runs one physical GPU, `num_physical = 1`, so the `--total-*`
+  values ARE the per-GPU values (no further division).
+* Llama3-70B uses standard GQA, so unlike an MLA model these head counts map
+  directly onto the `triton_unified_attention` path Starscream lives in — this is
+  a faithful shape, not a synthetic stand-in.
+* Per-device head derivation: `qh_dev = total_q_heads / num_physical` (= 8),
+  `kvh = total_kv_heads / num_physical` (= 1); in CPX local q-heads per XCD =
+  `qh_dev / cpx` (= 1).
 * Sweeps: `--seq-lens` (context length) × `--batch-sizes` (decode batch =
   concurrent sequences). The merge cost itself depends on batch size, num_heads,
   and head_size only; seq_len drives the upstream attention compute, which is
@@ -112,25 +136,30 @@ source via `PYTHONPATH=/workspace/vllm` (warnings about `vllm._C` are harmless).
 ## Running
 
 **Two separate runs, one per hardware partition mode.** SPX and CPX are hardware
-modes set with `rocm-smi`, NOT software flags — you must switch the hardware
-before each run. Compare the two CSVs offline.
+modes set with `rocm-smi`, NOT software flags — switch the hardware before each
+run. Both runs use a SINGLE physical GPU (SPX: 1 rank on GPU 0; CPX: 8 ranks on
+GPU 0's XCDs). Compare the two CSVs offline.
 
 ### Convenience launcher
 
 ```bash
-# SPX (8 GPUs) — set hardware first
+# SPX — 1 rank on one physical GPU (set hardware first)
 rocm-smi --setcomputepartition SPX
 ./tests/kernels/attention/run_starscream_bench.sh spx      # mode defaults to spx
 
-# CPX+NPS4 (64 vGPUs) — set hardware first
+# CPX+NPS4 — that same GPU's 8 XCDs, with the fast signal-pad barrier
 rocm-smi --setcomputepartition CPX
-./tests/kernels/attention/run_starscream_bench.sh cpx
+SIGNAL_PAD=1 ./tests/kernels/attention/run_starscream_bench.sh cpx
 ```
 
-Override sweeps / shapes via env vars (see the script header for the full list):
+The launcher pins devices automatically (SPX `CUDA_VISIBLE_DEVICES=0`,
+nproc=1; CPX `0,1,2,3,4,5,6,7`, nproc=cpx_size) and defaults to the Llama3-70B
+per-GPU shape (q=8, kv=1, head_size=128). Override via env vars (see script
+header): `DEVICES`, `SEQ_LENS`, `BATCH_SIZES`, `Q_HEADS`, `KV_HEADS`, `CPX_SIZE`,
+`SIGNAL_PAD`, `ITERS`, `CSV`. Example — a different physical GPU + quick sweep:
 
 ```bash
-SEQ_LENS=8192 BATCH_SIZES=1,32 ITERS=20 \
+DEVICES=8,9,10,11,12,13,14,15 SEQ_LENS=8192 BATCH_SIZES=1,32 SIGNAL_PAD=1 \
   ./tests/kernels/attention/run_starscream_bench.sh cpx
 ```
 
@@ -139,22 +168,25 @@ Default CSV output: `/workspace/bench_spx.csv` and `/workspace/bench_cpx.csv`.
 ### Manual invocation (equivalent)
 
 ```bash
-# SPX
+# SPX — one physical GPU, 1 rank
 rocm-smi --setcomputepartition SPX
+CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=/workspace/vllm \
-torchrun --nnodes=1 --nproc-per-node=8 \
+torchrun --nnodes=1 --nproc-per-node=1 \
   tests/kernels/attention/bench_starscream_attention.py \
-  --mode spx --total-q-heads 128 --total-kv-heads 128 --head-size 128 \
+  --mode spx --total-q-heads 8 --total-kv-heads 1 --head-size 128 \
   --seq-lens 256,8192,131072 --batch-sizes 1,8,32,64,128,256,512,1024 \
   --csv /workspace/bench_spx.csv
 
-# CPX
+# CPX — that GPU's 8 XCDs, signal-pad barrier on
 rocm-smi --setcomputepartition CPX
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 PYTHONPATH=/workspace/vllm \
 TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
-torchrun --nnodes=1 --nproc-per-node=64 \
+VLLM_STARSCREAM_SIGNAL_PAD_BARRIER=1 \
+torchrun --nnodes=1 --nproc-per-node=8 \
   tests/kernels/attention/bench_starscream_attention.py \
-  --mode cpx --cpx-size 8 --total-q-heads 128 --total-kv-heads 128 --head-size 128 \
+  --mode cpx --cpx-size 8 --total-q-heads 8 --total-kv-heads 1 --head-size 128 \
   --seq-lens 256,8192,131072 --batch-sizes 1,8,32,64,128,256,512,1024 \
   --csv /workspace/bench_cpx.csv
 ```

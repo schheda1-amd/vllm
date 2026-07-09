@@ -68,6 +68,7 @@ class SymmMemAllGatherBuffer:
         group_name: str,
         world_size: int,
         rank_in_group: int,
+        device_group=None,
     ) -> None:
         assert symm_mem_available, (
             "torch.distributed._symmetric_memory is not available; "
@@ -79,6 +80,8 @@ class SymmMemAllGatherBuffer:
         self.group_name = group_name
         self.world_size = world_size
         self.rank_in_group = rank_in_group
+        # torch ProcessGroup used only for the one-time cold-path init barrier.
+        self._group_for_init = device_group
 
         # Local shard staging buffer (symm-mem): each rank owns `numel` elems.
         self.buffer = torch_symm_mem.empty(numel, dtype=dtype, device=device)
@@ -91,6 +94,41 @@ class SymmMemAllGatherBuffer:
 
         # Optional multicast pointer (may be 0/unsupported, esp. on ROCm).
         self.multicast_ptr = getattr(self.handle, "multicast_ptr", 0)
+
+        # --- Signal pad for the on-device (RCCL-free) barrier. ---
+        # A separate symm-mem int32 buffer of `world_size` slots per rank.
+        # Slot j on rank r's pad means "rank j has signalled rank r". We use a
+        # monotonically increasing generation counter (never reset to 0) so a
+        # fast rank entering the next barrier can only raise a slot's value,
+        # never clobber a value a slow rank still needs to observe.
+        self._gen = 0
+        self.signal_pad = torch_symm_mem.empty(
+            world_size, dtype=torch.int32, device=device
+        )
+        self.signal_pad.zero_()
+        self.signal_handle = torch_symm_mem.rendezvous(
+            self.signal_pad, group=group_name
+        )
+        self.signal_peer_ptrs = torch.tensor(
+            self.signal_handle.buffer_ptrs, dtype=torch.int64, device=device
+        )
+        # One-time cross-rank sync so every rank has finished zeroing its pad
+        # before any peer can `arrive` into it. Without this, a peer's first
+        # arrive (xchg gen=1) could be overwritten by this rank's later zero,
+        # and the corresponding wait would spin forever. This is a cold-path
+        # (per-allocation) cost, not on the hot merge path.
+        torch.cuda.synchronize()
+        dist.barrier(group=self._group_for_init)
+        torch.cuda.synchronize()
+
+    def next_gen(self) -> int:
+        """Advance and return the barrier generation counter.
+
+        Barriers are collective, so every rank advances in lockstep and passes
+        the same generation value into the barrier kernel.
+        """
+        self._gen += 1
+        return self._gen
 
     def local_view(self, shape: torch.Size | tuple[int, ...]) -> torch.Tensor:
         """A view of this rank's own staging buffer with the given shape."""
@@ -119,11 +157,13 @@ class SymmMemAllGatherManager:
         device: torch.device,
         world_size: int,
         rank_in_group: int,
+        device_group=None,
     ) -> None:
         self.group_name = group_name
         self.device = device
         self.world_size = world_size
         self.rank_in_group = rank_in_group
+        self.device_group = device_group
         self._cache: dict[tuple[int, torch.dtype], SymmMemAllGatherBuffer] = {}
 
     def get_buffer(
@@ -139,6 +179,7 @@ class SymmMemAllGatherManager:
                 group_name=self.group_name,
                 world_size=self.world_size,
                 rank_in_group=self.rank_in_group,
+                device_group=self.device_group,
             )
             self._cache[key] = buf
         return buf
@@ -192,6 +233,7 @@ def get_symm_mem_allgather_manager(group) -> SymmMemAllGatherManager | None:
             device=group.device,
             world_size=group.world_size,
             rank_in_group=group.rank_in_group,
+            device_group=group.device_group,
         )
         _MANAGERS[group_name] = mgr
     return mgr

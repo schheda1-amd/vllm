@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_STARSCREAM_USE_SYMM_MEM: bool = False
     VLLM_STARSCREAM_FUSE_REDUCE: bool = False
+    VLLM_STARSCREAM_SIGNAL_PAD_BARRIER: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -1410,6 +1411,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Triton kernel. Implies the symm-mem path. reduce_segments is left intact.
     "VLLM_STARSCREAM_FUSE_REDUCE": lambda: bool(
         int(os.getenv("VLLM_STARSCREAM_FUSE_REDUCE", "0"))
+    ),
+    # Starscream (CPX+NPS4): replace the host-side dist.barrier used to bracket
+    # the symm-mem allgather with an on-device signal-pad barrier (a Triton
+    # kernel that arrives/waits via symmetric-memory peer pointers). This keeps
+    # RCCL entirely out of the merge critical path. Applies to both the
+    # symm-mem allgather (step1) and the fused kernel (step2).
+    "VLLM_STARSCREAM_SIGNAL_PAD_BARRIER": lambda: bool(
+        int(os.getenv("VLLM_STARSCREAM_SIGNAL_PAD_BARRIER", "0"))
     ),
     # Allows vllm to find tuned config under customized folder
     "VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),
