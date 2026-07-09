@@ -41,66 +41,78 @@ from vllm.triton_utils import tl, triton
 # ---------------------------------------------------------------------------
 # On-device signal-pad barrier (RCCL-free replacement for dist.barrier)
 # ---------------------------------------------------------------------------
-# Correctness model (all-to-all, monotonic generation):
-#   * Each rank owns an int32 signal pad of WORLD_SIZE slots. Slot j on rank
-#     r's pad = "rank j has signalled rank r at generation >= that value".
-#   * `gen` strictly increases per barrier and is the SAME on every rank (the
-#     barrier is collective). We compare with `>=`, never resetting to 0, so a
-#     fast rank entering gen+1 can only raise a slot, never clobber a value a
-#     slow rank still needs -> no reset race.
-#   * arrive : xchg gen into slot `rank` of EVERY peer's pad, release+sys, so
-#     the prior data write (buf.copy_) is published before the flag.
-#   * wait   : spin until EVERY slot of MY OWN pad is >= gen, acquire+sys, so
-#     once satisfied the peers' data writes are visible to my later reads.
-#   * sys scope: XCDs are distinct devices under CPX, so ordering must be
-#     system-wide, not just device-wide.
-#   * Launched single-program, single-warp: lane 0 does arrive-then-wait, no
-#     divergent intra-wave spin, no inter-CTA co-residency requirement ->
+# CUDA-graph-safe, sense-reversing (double-buffered) all-to-all barrier.
+#
+# Why not a host generation counter: under CUDA graph capture the host Python
+# runs ONCE, so a `gen` passed as a kernel argument freezes at its capture value
+# and the barrier becomes a no-op on every replay (each wait sees the previous
+# replay's flags already satisfied). The barrier must carry NO host state. Here
+# the phase lives in device memory and the KERNEL advances it, so every graph
+# replay re-executes a correct, freshly-phased barrier. (Pattern adapted from
+# the reference rs+gemm_symm.py sync_kernel, extended to double-buffering so it
+# is also safe in a tight per-iteration replay loop with no work between
+# barriers.)
+#
+# Protocol per call:
+#   * phase = *phase_ptr;  bank = phase & 1;  base = bank * WORLD_SIZE
+#   * arrive: atomic_add(+1) into slot `my_rank` of EVERY peer's pad in this
+#     bank, release+sys -> publishes our prior data store and announces arrival.
+#   * wait: spin until ALL WORLD_SIZE slots of MY OWN bank == WORLD_SIZE
+#     (every rank, including self, added 1), acquire+sys -> peers' data visible.
+#   * reset: zero MY OWN bank's slots for reuse two barriers later, then store
+#     phase+1. Alternating banks guarantee a fast rank's next arrival lands in
+#     the OTHER bank, so it can't clobber a slot a slow rank is still reading,
+#     and this rank's reset of bank b only races with uses of bank b that are
+#     >= 2 barriers away (impossible: a peer can't lap by two barriers).
+#   * Single program, single warp -> no inter-CTA co-residency requirement,
 #     deadlock-free.
 @triton.jit
 def _signal_pad_barrier_kernel(
-    signal_peer_ptrs,   # [W] int64 base pointers of every rank's signal pad
+    signal_peer_ptrs,   # [W] int64 base pointers of every rank's 2-bank pad
+    phase_ptr,          # int32[1] device-side local phase counter
     my_rank,            # this rank's index in the group
-    gen,                # generation stamp (>0), identical across ranks
     WORLD_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,  # next_pow2(WORLD_SIZE), lane block for the W peers
 ):
-    # Single program, single warp. Peer p is handled by lane p (masked to W).
     peer = tl.arange(0, BLOCK)
     mask = peer < WORLD_SIZE
 
-    # --- arrive: stamp `gen` into slot `my_rank` on EVERY peer's pad ---
-    # One vectorized scatter. release+sys so our preceding data store
-    # (buf.copy_) is globally visible before the flag it publishes.
-    peer_base = tl.load(signal_peer_ptrs + peer, mask=mask, other=0)
-    flag_ptr = peer_base.to(tl.pointer_type(tl.int32)) + my_rank
-    tl.atomic_xchg(flag_ptr, gen, mask=mask, sem="release", scope="sys")
+    # Device-side phase -> bank parity. Advances on every (re)play.
+    phase = tl.load(phase_ptr)
+    base = (phase % 2) * WORLD_SIZE
 
-    # --- wait: spin until EVERY slot on MY OWN pad has reached `gen` ---
-    # acquire+sys so peers' data stores are visible once we proceed. Masked-out
-    # lanes are forced to `gen` so they never hold up the min-reduction.
+    # --- arrive: +1 into slot `my_rank` of every peer's pad, this bank ---
+    peer_base = tl.load(signal_peer_ptrs + peer, mask=mask, other=0)
+    flag_ptr = peer_base.to(tl.pointer_type(tl.int32)) + base + my_rank
+    tl.atomic_add(flag_ptr, 1, mask=mask, sem="release", scope="sys")
+
+    # --- wait: all WORLD_SIZE slots of my own bank == WORLD_SIZE ---
     my_base = tl.load(signal_peer_ptrs + my_rank).to(tl.pointer_type(tl.int32))
-    slot_ptr = my_base + peer
+    slot_ptr = my_base + base + peer
     done = 0
     while done == 0:
-        # atomic_add(...,0) is an acquire load.
         vals = tl.atomic_add(slot_ptr, 0, mask=mask, sem="acquire", scope="sys")
-        minv = tl.min(tl.where(mask, vals, gen))
-        done = (minv >= gen).to(tl.int32)
+        # masked-out lanes forced to WORLD_SIZE so they never gate the min.
+        minv = tl.min(tl.where(mask, vals, WORLD_SIZE))
+        done = (minv >= WORLD_SIZE).to(tl.int32)
+
+    # --- reset my bank for reuse, and advance phase for the next call ---
+    tl.store(slot_ptr, 0, mask=mask)
+    tl.store(phase_ptr, phase + 1)
 
 
 def signal_pad_barrier(buf) -> None:
-    """On-device barrier over the group via a symm-mem signal pad.
+    """On-device, CUDA-graph-safe barrier over the group via a symm-mem pad.
 
     Replaces ``dist.barrier`` (an RCCL collective) with a single-warp Triton
     kernel that arrives/waits through symmetric-memory peer pointers, keeping
-    RCCL out of the merge critical path. ``buf`` is a SymmMemAllGatherBuffer.
+    RCCL out of the merge critical path. Sense-reversing + device-side phase, so
+    it is correct under CUDA graph replay. ``buf`` is a SymmMemAllGatherBuffer.
     """
-    gen = buf.next_gen()
     _signal_pad_barrier_kernel[(1,)](
         signal_peer_ptrs=buf.signal_peer_ptrs,
+        phase_ptr=buf.phase,
         my_rank=buf.rank_in_group,
-        gen=gen,
         WORLD_SIZE=buf.world_size,
         BLOCK=triton.next_power_of_2(buf.world_size),
         num_warps=1,

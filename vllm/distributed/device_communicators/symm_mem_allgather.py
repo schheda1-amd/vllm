@@ -96,14 +96,24 @@ class SymmMemAllGatherBuffer:
         self.multicast_ptr = getattr(self.handle, "multicast_ptr", 0)
 
         # --- Signal pad for the on-device (RCCL-free) barrier. ---
-        # A separate symm-mem int32 buffer of `world_size` slots per rank.
-        # Slot j on rank r's pad means "rank j has signalled rank r". We use a
-        # monotonically increasing generation counter (never reset to 0) so a
-        # fast rank entering the next barrier can only raise a slot's value,
-        # never clobber a value a slow rank still needs to observe.
-        self._gen = 0
+        # CUDA-graph-safe, sense-reversing (double-buffered) barrier.
+        #
+        # Why device-side + self-resetting: under CUDA graph capture, host
+        # Python runs ONCE, so a host-incremented generation counter passed as a
+        # kernel arg freezes at its capture value and the barrier degenerates to
+        # a no-op on every replay. The barrier must therefore carry NO host
+        # state: the phase lives in device memory and the kernel advances it, so
+        # each graph replay re-executes a correct barrier.
+        #
+        # Layout: 2 banks of `world_size` int32 slots. Bank b, slot j on rank
+        # r's pad = "rank j has arrived at bank b for rank r". Consecutive
+        # barriers alternate banks (phase parity), so a fast rank's arrival for
+        # barrier N+1 lands in the other bank and cannot clobber a slow rank
+        # still finishing barrier N. Double-buffering suffices because a rank
+        # cannot lap another by two barriers (finishing N+1 requires the peer to
+        # participate in N+1). Each bank self-resets (zeroed) after use.
         self.signal_pad = torch_symm_mem.empty(
-            world_size, dtype=torch.int32, device=device
+            2 * world_size, dtype=torch.int32, device=device
         )
         self.signal_pad.zero_()
         self.signal_handle = torch_symm_mem.rendezvous(
@@ -112,23 +122,16 @@ class SymmMemAllGatherBuffer:
         self.signal_peer_ptrs = torch.tensor(
             self.signal_handle.buffer_ptrs, dtype=torch.int64, device=device
         )
+        # Device-side phase counter (per-rank LOCAL, not symm-mem). The kernel
+        # reads it, uses (phase & 1) to pick the bank, and stores phase+1 -- so
+        # it advances correctly on every graph replay. Absolute value is
+        # irrelevant; only parity matters, and parity alternates from any start.
+        self.phase = torch.zeros(1, dtype=torch.int32, device=device)
         # One-time cross-rank sync so every rank has finished zeroing its pad
-        # before any peer can `arrive` into it. Without this, a peer's first
-        # arrive (xchg gen=1) could be overwritten by this rank's later zero,
-        # and the corresponding wait would spin forever. This is a cold-path
-        # (per-allocation) cost, not on the hot merge path.
+        # before any peer can arrive into it. Cold-path (per-allocation) only.
         torch.cuda.synchronize()
         dist.barrier(group=self._group_for_init)
         torch.cuda.synchronize()
-
-    def next_gen(self) -> int:
-        """Advance and return the barrier generation counter.
-
-        Barriers are collective, so every rank advances in lockstep and passes
-        the same generation value into the barrier kernel.
-        """
-        self._gen += 1
-        return self._gen
 
     def local_view(self, shape: torch.Size | tuple[int, ...]) -> torch.Tensor:
         """A view of this rank's own staging buffer with the given shape."""
