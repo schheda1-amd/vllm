@@ -286,9 +286,18 @@ def _bench_variant_graph(mode, tn, grp, cpx, head_size, warmup, iters):
     comparison rests on. Raises if the region is not capturable (e.g. a variant
     that still uses a host dist.barrier); the caller falls back to eager.
 
-    Returns per-iter latency (us) as the timed replay block / iters, MAX over
-    ranks. Graph replay is deterministic, so a block average is stable (no need
-    for per-iter medians) and, crucially, carries zero inter-iter host sync.
+    Returns median per-replay latency (us), MAX over ranks.
+
+    CRITICAL: each replay is timed INDIVIDUALLY with a cross-rank barrier before
+    it and a full synchronize after it. This is required for correctness in CPX
+    mode, where the graph contains cross-XCD collectives (query all-gather +
+    merge). If we instead timed a block of back-to-back replays with no per-iter
+    sync, the 8 XCDs would pipeline/overlap across iterations and the collective
+    latency would hide under adjacent iterations' compute -- making CPX look
+    artificially fast. Per-replay sync forces every decode step to fully
+    complete on all ranks before the next starts, so each sample is one true
+    synchronized decode step. Graph capture still removes host launch overhead
+    from within the step; only the (real) per-step comm latency remains.
     """
     call = lambda: _attention_call(mode, tn, grp, cpx, head_size)
 
@@ -314,17 +323,22 @@ def _bench_variant_graph(mode, tn, grp, cpx, head_size, warmup, iters):
     torch.cuda.synchronize()
     dist.barrier()
 
-    # Time a block of `iters` replays with no host sync in between.
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    # Time each replay individually; barrier-align ranks before each so no
+    # cross-iteration overlap can hide collective latency.
+    times_ms = []
     for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        dist.barrier()
+        start.record()
         g.replay()
-    end.record()
-    torch.cuda.synchronize()
+        end.record()
+        torch.cuda.synchronize()
+        times_ms.append(start.elapsed_time(end))
 
-    per_iter_us = (start.elapsed_time(end) / iters) * 1000.0
-    return _all_reduce_max(per_iter_us)  # slowest XCD = critical path
+    times_ms.sort()
+    median_us = times_ms[len(times_ms) // 2] * 1000.0
+    return _all_reduce_max(median_us)  # slowest XCD = critical path
 
 
 def _bench_variant(mode, tn, grp, cpx, head_size, warmup, iters, use_graph):
