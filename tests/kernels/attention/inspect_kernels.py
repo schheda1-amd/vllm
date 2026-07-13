@@ -111,6 +111,23 @@ def main():
         except sqlite3.Error as e:
             print(f"  counter query failed: {e}")
 
+    # PER-KERNEL counter breakdown: which kernel holds the memory traffic.
+    # Joins pmc events -> dispatch (event_id) -> symbol name.
+    if pmc_ev and pmc_info and disp and ksym and name_col and id_col:
+        print("\n=== per-kernel COUNTER bytes (counter | kernel | summed KB) ===")
+        try:
+            q = (f"SELECT ip.name, ks.\"{name_col}\", SUM(pe.value) "
+                 f"FROM {pmc_ev} pe "
+                 f"JOIN {pmc_info} ip ON pe.pmc_id = ip.id "
+                 f"JOIN {disp} kd ON pe.event_id = kd.event_id "
+                 f"JOIN {ksym} ks ON kd.kernel_id = ks.\"{id_col}\" "
+                 f"WHERE ip.name NOT LIKE 'KFD%' "
+                 f"GROUP BY ip.name, ks.\"{name_col}\" ORDER BY 3 DESC LIMIT 25")
+            for cname, kname, val in con.execute(q):
+                print(f"  {val:14.1f} KB  {cname:<12} {(kname or '')[:55]}")
+        except sqlite3.Error as e:
+            print(f"  per-kernel counter join failed: {e}")
+
     con.close()
 
 
