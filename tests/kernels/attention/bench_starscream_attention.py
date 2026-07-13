@@ -365,6 +365,53 @@ _MODEL_CONFIGS = {
 }
 
 
+def _run_profile_mode(args, grp, cpx, qh_dev, kvh, device):
+    """Execute ONE shape / ONE variant N times for an external profiler.
+
+    No timing, no CSV: the caller wraps this process in rocprofv3, which
+    attributes memory counters to the attention kernels launched here. We just
+    allocate the single (seq_len, batch) cell, select the variant via the same
+    env flags the sweep uses, warm up (JIT + first-touch, excluded because the
+    profiler counts all dispatches -- warmup is fine, it inflates counts
+    uniformly and we report bandwidth = bytes/time which is warmup-invariant),
+    then run --profile-iters attention calls.
+    """
+    S = args.profile_seq_len
+    B = args.profile_batch
+    variant = args.profile_variant or ("spx" if args.mode == "spx" else "step2")
+
+    _log(f"[profile] mode={args.mode} variant={variant} seq_len={S} batch={B} "
+         f"iters={args.profile_iters}")
+
+    ok, tn = _try_alloc(args.mode, B, S, qh_dev, kvh, args.head_size,
+                        args.block_size, cpx, device)
+    ok_all = _all_reduce_min_int(1 if ok else 0)
+    if not ok_all:
+        if ok:
+            del tn
+            torch.cuda.empty_cache()
+        _log(f"[profile] SKIP(OOM) seq_len={S} batch={B}")
+        return
+
+    if args.mode == "cpx":
+        _set_variant_env(variant)
+
+    # Warmup (JIT / first-touch / rendezvous) BEFORE the profiled region would
+    # ideally be excluded, but rocprofv3 counts the whole process. Since we
+    # report bytes/time (an intensity ratio, not an absolute), a few warmup
+    # dispatches do not bias it. Keep warmup small.
+    for _ in range(3):
+        _attention_call(args.mode, tn, grp, cpx, args.head_size)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    for _ in range(args.profile_iters):
+        _attention_call(args.mode, tn, grp, cpx, args.head_size)
+    torch.cuda.synchronize()
+    dist.barrier()
+    _log(f"[profile] done: {args.profile_iters} calls of {variant}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["spx", "cpx"], required=True)
@@ -420,6 +467,22 @@ def main():
                    help="seq_len for the pre-sweep sanity check")
     p.add_argument("--sanity-batch", type=int, default=1,
                    help="batch size for the pre-sweep sanity check")
+    # --- Profiling mode: run ONE shape / ONE variant under an external
+    # profiler (rocprofv3). No timing, no CSV, no sweep -- just execute the
+    # attention call `--profile-iters` times so the profiler attributes memory
+    # counters to a single well-defined workload. Everything else is skipped. ---
+    p.add_argument("--profile", action="store_true",
+                   help="Profiling mode: execute one shape/variant N times for "
+                        "an external profiler (rocprofv3), then exit.")
+    p.add_argument("--profile-seq-len", type=int, default=8192)
+    p.add_argument("--profile-batch", type=int, default=1)
+    p.add_argument("--profile-variant", choices=["spx", "rccl", "step1",
+                                                 "step2"], default=None,
+                   help="Which path to profile. Defaults to 'spx' in spx mode "
+                        "and 'step2' in cpx mode.")
+    p.add_argument("--profile-iters", type=int, default=30,
+                   help="Number of attention calls to execute under the "
+                        "profiler (counters accumulate over these).")
     args = p.parse_args()
 
     # --- Resolve head shapes: model preset (or llama3-70b fallback) as the
@@ -481,6 +544,13 @@ def main():
     )
     grp = get_dcp_group()
     device = torch.device(f"cuda:{_local_rank}")
+
+    # --- Profiling mode: single shape / single variant, no timing. ---
+    if args.profile:
+        _run_profile_mode(args, grp, cpx, qh_dev, kvh, device)
+        destroy_model_parallel()
+        dist.destroy_process_group()
+        return
 
     seq_lens = [int(x) for x in args.seq_lens.split(",")]
     token_offsets = sorted(int(x) for x in args.token_offsets.split(","))
