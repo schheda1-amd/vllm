@@ -49,6 +49,32 @@ def _obj_exists(con, name):
     return row is not None
 
 
+def _resolve(con, *candidates):
+    """First existing table/view name from candidates (incl. suffixed base)."""
+    have = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+    for c in candidates:
+        if c in have:
+            return c
+    for c in candidates:
+        for name in have:
+            if name.startswith(c + "_"):
+                return name
+    return None
+
+
+def _kernel_name_id_cols(con, ksym):
+    """Resolve (name_col, id_col) for the kernel-symbol table across versions."""
+    if not ksym:
+        return None, None
+    cols = [r[1] for r in con.execute(f'PRAGMA table_info("{ksym}")')]
+    name_col = next((c for c in ("kernel_name", "formatted_kernel_name",
+                                 "display_name", "demangled_kernel_name",
+                                 "name") if c in cols), None)
+    id_col = next((c for c in ("id", "kernel_id") if c in cols), None)
+    return name_col, id_col
+
+
 def _gpu_agent_ids(con):
     """Set of agent_id values whose type is GPU (exclude CPU sockets)."""
     ids = set()
@@ -63,7 +89,7 @@ def _gpu_agent_ids(con):
     return ids
 
 
-def parse_db(db_path, rd_counter, wr_counter, unit_bytes):
+def parse_db(db_path, rd_counter, wr_counter, unit_bytes, kernel_filter):
     """Return (bytes, busy_ns, n_gpu_agents_with_work) for ONE db.
 
     `bytes` = summed (rd/wr counter) * scale over GPU agents in this db (a db
@@ -99,39 +125,78 @@ def parse_db(db_path, rd_counter, wr_counter, unit_bytes):
             ids = ",".join(str(i) for i in sorted(gpu_ids))
             return f" AND {col} IN ({ids})"
 
-        # Counter bytes (KB -> bytes) for the counters present in this db.
-        placeholders = ",".join("?" for _ in (rd_counter, wr_counter))
-        q_cnt = (
-            "SELECT SUM(pe.value) "
-            "FROM rocpd_pmc_event pe "
-            "JOIN rocpd_info_pmc ip ON pe.pmc_id = ip.id "
-            f"WHERE ip.name IN ({placeholders})"
-            + _gpu_filter("ip.agent_id")
-        )
-        row = con.execute(q_cnt, (rd_counter, wr_counter)).fetchone()
-        kb = float(row[0] or 0.0) if row else 0.0
+        # --- Kernel-name filter (CRITICAL for CPX) --------------------------
+        # PMC counters are per-DISPATCH, so under rocprofv3's replay the counter
+        # events and durations cover EVERY kernel -- including the spin-wait
+        # signal-pad barrier, the RCCL allgather, and buffer fills/copies. Those
+        # dwarf the attention kernel (~200x its time) and would completely
+        # dominate a "bandwidth" number. For the memory-bound decode-attention
+        # claim we must scope BOTH bytes and time to the attention kernel(s)
+        # only. We join pmc events -> kernel_dispatch (event_id) -> kernel
+        # symbols (kernel name) and keep only names matching `kernel_filter`.
+        ksym = _resolve(con, "kernel_symbols", "rocpd_info_kernel_symbol")
+        name_col, id_col = _kernel_name_id_cols(con, ksym)
+        can_filter = bool(ksym and name_col and id_col)
+
         scale = 1.0 if unit_bytes else 1024.0
-        db_bytes = kb * scale
+        placeholders = ",".join("?" for _ in (rd_counter, wr_counter))
 
-        # GPU kernel-busy ns in this db. If a db contains multiple GPU agents
-        # (XCDs), they run CONCURRENTLY, so this db's wall time is the MAX of
-        # per-agent busy sums, not the sum across agents. (On the real runs each
-        # rank writes its own db with a single XCD, so this equals that XCD's
-        # busy; the max-over-agents form just makes it robust either way.)
-        q_busy = (
-            'SELECT agent_id, SUM("end" - start) FROM rocpd_kernel_dispatch '
-            "WHERE 1=1" + _gpu_filter("agent_id") + " GROUP BY agent_id"
-        )
+        # kernel_filter is a list of name substrings; keep a dispatch if its
+        # kernel name matches ANY of them (OR of LIKEs).
+        filters = [s for s in (kernel_filter or []) if s]
+        can_filter = can_filter and bool(filters)
+
+        if can_filter:
+            likes = [f"%{s}%" for s in filters]
+            like_or = " OR ".join(f'ks."{name_col}" LIKE ?' for _ in likes)
+            # Bytes: counter events whose dispatch ran a matching kernel.
+            q_cnt = (
+                "SELECT SUM(pe.value) "
+                "FROM rocpd_pmc_event pe "
+                "JOIN rocpd_info_pmc ip ON pe.pmc_id = ip.id "
+                "JOIN rocpd_kernel_dispatch kd ON pe.event_id = kd.event_id "
+                f"JOIN {ksym} ks ON kd.kernel_id = ks.\"{id_col}\" "
+                f"WHERE ip.name IN ({placeholders}) "
+                f"AND ({like_or})"
+                + _gpu_filter("kd.agent_id")
+            )
+            row = con.execute(
+                q_cnt, (rd_counter, wr_counter, *likes)).fetchone()
+            db_bytes = (float(row[0] or 0.0) if row else 0.0) * scale
+
+            # Time: matching-kernel busy ns per agent, concurrent -> max.
+            q_busy = (
+                'SELECT kd.agent_id, SUM(kd."end" - kd.start) '
+                f"FROM rocpd_kernel_dispatch kd "
+                f"JOIN {ksym} ks ON kd.kernel_id = ks.\"{id_col}\" "
+                f"WHERE ({like_or})"
+                + _gpu_filter("kd.agent_id")
+                + " GROUP BY kd.agent_id"
+            )
+            busy_rows = con.execute(q_busy, tuple(likes)).fetchall()
+        else:
+            # No kernel filter available -> whole-db (contaminated for CPX).
+            q_cnt = (
+                "SELECT SUM(pe.value) FROM rocpd_pmc_event pe "
+                "JOIN rocpd_info_pmc ip ON pe.pmc_id = ip.id "
+                f"WHERE ip.name IN ({placeholders})"
+                + _gpu_filter("ip.agent_id")
+            )
+            row = con.execute(q_cnt, (rd_counter, wr_counter)).fetchone()
+            db_bytes = (float(row[0] or 0.0) if row else 0.0) * scale
+            q_busy = (
+                'SELECT agent_id, SUM("end" - start) FROM rocpd_kernel_dispatch '
+                "WHERE 1=1" + _gpu_filter("agent_id") + " GROUP BY agent_id"
+            )
+            busy_rows = con.execute(q_busy).fetchall()
+
+        # Concurrent XCDs -> this db's wall time is the MAX per-agent busy sum.
         busy_ns = 0.0
-        for _aid, b in con.execute(q_busy):
-            busy_ns = max(busy_ns, float(b or 0.0))
-
-        # How many distinct GPU agents actually did work (diagnostic).
-        q_na = (
-            "SELECT COUNT(DISTINCT agent_id) FROM rocpd_kernel_dispatch "
-            "WHERE 1=1" + _gpu_filter("agent_id")
-        )
-        n_agents = int(con.execute(q_na).fetchone()[0] or 0)
+        n_agents = 0
+        for _aid, b in busy_rows:
+            if b:
+                n_agents += 1
+                busy_ns = max(busy_ns, float(b))
 
         return db_bytes, busy_ns, n_agents
     finally:
@@ -147,11 +212,23 @@ def main():
     p.add_argument("--seq-len", type=int, required=True)
     p.add_argument("--batch", type=int, required=True)
     p.add_argument("--out-csv", required=True)
+    p.add_argument("--kernel-filter",
+                   default="kernel_unified_attention,reduce_segments,"
+                           "_fused_allgather_reduce_kernel",
+                   help="Comma-separated kernel-name substrings to count "
+                        "(SQL LIKE, OR'd). Default scopes bandwidth to the "
+                        "attention kernels AND the Starscream merge kernels "
+                        "(reduce_segments / _fused_allgather_reduce_kernel), "
+                        "which ARE the CPX contribution, while excluding the "
+                        "spin-wait barrier, RCCL allgather, and buffer fills/"
+                        "copies that dominate under PMC replay. Empty = whole db.")
     p.add_argument("--rd-counter", default="FETCH_SIZE")
     p.add_argument("--wr-counter", default="WRITE_SIZE")
     p.add_argument("--unit-bytes", action="store_true",
                    help="counters already in bytes (default: KB -> *1024)")
     args = p.parse_args()
+    kfilters = [s.strip() for s in (args.kernel_filter or "").split(",")
+                if s.strip()]
 
     dbs = sorted(glob.glob(args.db_glob, recursive=True))
     if not dbs:
@@ -166,7 +243,8 @@ def main():
     for db_path in dbs:
         try:
             db_bytes, busy_ns, n_agents = parse_db(
-                db_path, args.rd_counter, args.wr_counter, args.unit_bytes)
+                db_path, args.rd_counter, args.wr_counter, args.unit_bytes,
+                kfilters)
         except Exception as e:  # noqa: BLE001
             print(f"[bw-parse] WARN: {db_path}: {e}", file=sys.stderr)
             continue
