@@ -116,36 +116,45 @@ for S in "${SEQS[@]}"; do
         echo ""
         echo "--- profiling S=$S B=$B (variant=$PROFILE_VARIANT) ---"
 
-        # rocprofv3 PMC-ONLY pass. IMPORTANT: --pmc must NOT be combined with
-        # --kernel-trace -- PMC collection needs a replay pass, and mixing the
-        # two silently yields zero counter rows. A --pmc pass also populates
-        # rocpd_kernel_dispatch (durations), so we get both from one run.
-        # FETCH_SIZE / WRITE_SIZE are KB read/written at the HBM interface
-        # (this GPU's exposed memory-traffic counters).
+        # rocprofv3 PMC passes. TWO important constraints:
+        #  1. --pmc must NOT be combined with --kernel-trace (PMC needs a replay
+        #     pass; mixing yields zero counter rows). A --pmc pass populates
+        #     rocpd_kernel_dispatch (durations) on its own.
+        #  2. FETCH_SIZE and WRITE_SIZE are DERIVED counters that each expand to
+        #     several base TCC counters; requesting BOTH in one pass exceeds the
+        #     hardware counter-slot budget ("error 38: Request exceeds the
+        #     capabilities of the hardware to collect"). So collect them in
+        #     SEPARATE passes. The parser merges the per-counter dbs by agent.
         env_prefix=(CUDA_VISIBLE_DEVICES="$DEVICES" PYTHONPATH="$VLLM_SRC")
         if [[ "$BENCH_MODE" == "cpx" ]]; then
             env_prefix+=(TORCH_SYMM_MEM_DISABLE_MULTICAST=1
                          VLLM_STARSCREAM_SIGNAL_PAD_BARRIER="$SIGNAL_PAD")
         fi
 
-        env "${env_prefix[@]}" \
-            rocprofv3 --pmc FETCH_SIZE WRITE_SIZE \
-                      -d "$CELL_DIR" \
-                      -- torchrun --nnodes=1 --nproc-per-node="$NPROC" \
-                         --rdzv_endpoint="localhost:$PORT" \
-                         "$BENCH" "${COMMON[@]}" \
-            2>&1 | tee "$CELL_DIR/rocprof.log" || {
-                echo "  rocprofv3 run failed for S=$S B=$B (see log)"; continue; }
+        pass_failed=0
+        for CTR in FETCH_SIZE WRITE_SIZE; do
+            P="$(find_port)"
+            env "${env_prefix[@]}" \
+                rocprofv3 --pmc "$CTR" \
+                          -d "$CELL_DIR/$CTR" \
+                          -- torchrun --nnodes=1 --nproc-per-node="$NPROC" \
+                             --rdzv_endpoint="localhost:$P" \
+                             "$BENCH" "${COMMON[@]}" \
+                2>&1 | tee "$CELL_DIR/rocprof_$CTR.log" || {
+                    echo "  rocprofv3 $CTR pass failed for S=$S B=$B"; \
+                    pass_failed=1; break; }
+        done
+        [[ "$pass_failed" -eq 1 ]] && continue
 
-        # rocprofv3 writes one <pid>_results.db PER RANK under -d (nested in a
-        # per-node subdir). SPX -> 1 db; CPX -> 8 dbs (one per XCD). The parser
-        # globs and merges all of them, so pass the whole cell dir.
+        # Each pass writes one <pid>_results.db PER RANK under its subdir.
+        # SPX -> 2 dbs (fetch, write); CPX -> 16 dbs (2 passes x 8 XCDs).
+        # The parser globs the whole cell dir and merges by agent uuid.
         NDB="$(find "$CELL_DIR" -name '*.db' 2>/dev/null | wc -l)"
         if [[ "$NDB" -eq 0 ]]; then
             echo "  no *.db found under $CELL_DIR; skipping parse"
             continue
         fi
-        echo "  found $NDB db file(s) for this cell"
+        echo "  found $NDB db file(s) for this cell (2 passes x ranks)"
 
         PYTHONPATH="$VLLM_SRC" python3 "$PARSER" \
             --db-glob "$CELL_DIR/**/*.db" --mode "$MODE" \

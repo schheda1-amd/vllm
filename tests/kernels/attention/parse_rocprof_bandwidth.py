@@ -40,22 +40,43 @@ def _table_exists(con, name):
     return row is not None
 
 
-def _agent_busy_ns(con):
-    """Per-agent kernel busy time (ns) = sum of (end - start) over dispatches."""
+def _agent_gkey_map(con):
+    """Map local agent_id -> GLOBAL agent key that is stable across dbs.
+
+    We prefer the agent uuid (unique per physical device); prefix with pid so
+    that different ranks' processes never collide even if uuids repeat. Falls
+    back to 'pid:agent_id' if uuid is unavailable.
+    """
+    out = {}
+    if _table_exists(con, "rocpd_info_agent"):
+        try:
+            for aid, pid, uuid in con.execute(
+                "SELECT id, pid, uuid FROM rocpd_info_agent"
+            ):
+                out[int(aid)] = f"{pid}:{uuid}"
+            if out:
+                return out
+        except sqlite3.OperationalError:
+            pass
+    return out  # possibly empty -> caller uses 'agent_id' fallback
+
+
+def _agent_busy_ns(con, gkey):
+    """Global-agent kernel busy time (ns) = sum of (end - start)."""
     out = {}
     for agent_id, busy in con.execute(
         'SELECT agent_id, SUM("end" - start) '
         "FROM rocpd_kernel_dispatch GROUP BY agent_id"
     ):
-        out[int(agent_id)] = float(busy or 0.0)
+        k = gkey.get(int(agent_id), f"agent:{int(agent_id)}")
+        out[k] = out.get(k, 0.0) + float(busy or 0.0)
     return out
 
 
-def _agent_counter_sums(con, counter_names):
-    """Per-agent summed value for each requested counter name.
+def _agent_counter_sums(con, counter_names, gkey):
+    """Global-agent summed value per counter name.
 
-    Returns {agent_id: {counter_name: value}}.
-    Joins pmc events to their definitions (name + agent).
+    Returns {global_key: {counter_name: value}}.
     """
     placeholders = ",".join("?" for _ in counter_names)
     q = (
@@ -67,7 +88,9 @@ def _agent_counter_sums(con, counter_names):
     )
     out = {}
     for agent_id, name, val in con.execute(q, counter_names):
-        out.setdefault(int(agent_id), {})[name] = float(val or 0.0)
+        k = gkey.get(int(agent_id), f"agent:{int(agent_id)}")
+        out.setdefault(k, {})[name] = out.setdefault(k, {}).get(name, 0.0) \
+            + float(val or 0.0)
     return out
 
 
@@ -88,8 +111,9 @@ def parse(db_path, rd_counter, wr_counter, unit_bytes):
                 "PMC-only pass) or the counter names are invalid. "
                 f"Non-KFD counters present: {names or '(none)'}")
 
-        busy = _agent_busy_ns(con)
-        csums = _agent_counter_sums(con, [rd_counter, wr_counter])
+        gkey = _agent_gkey_map(con)
+        busy = _agent_busy_ns(con, gkey)
+        csums = _agent_counter_sums(con, [rd_counter, wr_counter], gkey)
         if not csums:
             avail = [r[0] for r in con.execute(
                 "SELECT DISTINCT name FROM rocpd_info_pmc "
@@ -100,12 +124,13 @@ def parse(db_path, rd_counter, wr_counter, unit_bytes):
 
         unit_scale = 1.0 if unit_bytes else 1024.0  # KB -> bytes by default
         agents = {}
-        for agent_id, cs in csums.items():
+        for k, cs in csums.items():
+            # This pass may carry only ONE of the two counters (split passes).
             rd = cs.get(rd_counter, 0.0)
             wr = cs.get(wr_counter, 0.0)
-            agents[agent_id] = {
+            agents[k] = {
                 "bytes": (rd + wr) * unit_scale,
-                "busy_ns": busy.get(agent_id, 0.0),
+                "busy_ns": busy.get(k, 0.0),
             }
         return agents
     finally:
@@ -134,19 +159,29 @@ def main():
         _append_row(args, 0, [], float("nan"), float("nan"), float("nan"))
         return
 
-    # Merge agents across all per-rank dbs. Each rank's db reports its own
-    # agent(s); keyed by (db_index, agent_id) so distinct ranks never collide
-    # even if they reuse the same local agent_id numbering.
-    agents = {}
-    for i, db_path in enumerate(dbs):
+    # Counters may be split across multiple rocprofv3 passes (FETCH_SIZE and
+    # WRITE_SIZE exceed the per-pass hardware counter budget when combined). So
+    # a cell dir can contain: (passes) x (ranks) db files. We merge by GLOBAL
+    # agent identity -- (uuid) if available, else (pid, agent_id) -- so the same
+    # physical XCD seen in the fetch-pass db and the write-pass db is ONE agent
+    # whose bytes = FETCH + WRITE and whose busy_ns is taken from whichever pass
+    # (both run the identical workload, so durations match). Different ranks/XCDs
+    # stay distinct via pid/uuid.
+    merged = {}  # global_agent_key -> {'bytes': float, 'busy_ns': float}
+    for db_path in dbs:
         try:
             a = parse(db_path, args.rd_counter, args.wr_counter,
                       args.unit_bytes)
         except Exception as e:  # noqa: BLE001
             print(f"[bw-parse] WARN: {db_path}: {e}", file=sys.stderr)
             continue
-        for agent_id, rec in a.items():
-            agents[(i, agent_id)] = rec
+        for gkey, rec in a.items():
+            m = merged.setdefault(gkey, {"bytes": 0.0, "busy_ns": 0.0})
+            m["bytes"] += rec["bytes"]
+            # durations repeat across passes for the same workload -> take max,
+            # not sum, so a 2-pass split doesn't double the time.
+            m["busy_ns"] = max(m["busy_ns"], rec["busy_ns"])
+    agents = merged
     if not agents:
         print(f"[bw-parse] ERROR: no counters parsed from {len(dbs)} db(s)",
               file=sys.stderr)
