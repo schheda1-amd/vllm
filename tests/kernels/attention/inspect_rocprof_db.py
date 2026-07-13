@@ -35,10 +35,14 @@ def main():
     print(f"DB: {db}\n")
     con = sqlite3.connect(db)
 
-    tables = [r[0] for r in con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+    # Include BOTH tables and views (rocpd_* may be exposed as views).
+    objs = list(con.execute(
+        "SELECT name, type FROM sqlite_master "
+        "WHERE type IN ('table','view') ORDER BY type, name"))
+    tables = [name for name, _ in objs]
+    types = {name: typ for name, typ in objs}
 
-    print("=== ALL TABLES (name : row count) ===")
+    print("=== ALL TABLES/VIEWS (type name : row count) ===")
     counts = {}
     for t in tables:
         try:
@@ -46,7 +50,7 @@ def main():
         except sqlite3.Error as e:
             n = f"ERR({e})"
         counts[t] = n
-        print(f"  {t}: {n}")
+        print(f"  [{types[t]}] {t}: {n}")
 
     print("\n=== DETAIL for counter/pmc/event/dispatch/agent tables ===")
     hints = ("counter", "pmc", "event", "dispatch", "agent", "info")

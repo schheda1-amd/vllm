@@ -34,8 +34,12 @@ import sys
 
 
 def _table_exists(con, name):
+    # Accept both base tables AND views: newer rocpd schemas expose rocpd_*
+    # (including rocpd_pmc_event) as VIEWS over normalized base tables, which a
+    # type='table'-only check would miss.
     row = con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        "SELECT name FROM sqlite_master "
+        "WHERE type IN ('table','view') AND name=?",
         (name,)).fetchone()
     return row is not None
 
