@@ -116,8 +116,12 @@ for S in "${SEQS[@]}"; do
         echo ""
         echo "--- profiling S=$S B=$B (variant=$PROFILE_VARIANT) ---"
 
-        # rocprofv3: memory-controller request counters + kernel durations.
-        # --pmc counters accumulate per dispatch; kernel-trace gives durations.
+        # rocprofv3 PMC-ONLY pass. IMPORTANT: --pmc must NOT be combined with
+        # --kernel-trace -- PMC collection needs a replay pass, and mixing the
+        # two silently yields zero counter rows. A --pmc pass also populates
+        # rocpd_kernel_dispatch (durations), so we get both from one run.
+        # FETCH_SIZE / WRITE_SIZE are KB read/written at the HBM interface
+        # (this GPU's exposed memory-traffic counters).
         env_prefix=(CUDA_VISIBLE_DEVICES="$DEVICES" PYTHONPATH="$VLLM_SRC")
         if [[ "$BENCH_MODE" == "cpx" ]]; then
             env_prefix+=(TORCH_SYMM_MEM_DISABLE_MULTICAST=1
@@ -125,8 +129,7 @@ for S in "${SEQS[@]}"; do
         fi
 
         env "${env_prefix[@]}" \
-            rocprofv3 --pmc TCC_EA_RDREQ TCC_EA_WRREQ \
-                      --kernel-trace \
+            rocprofv3 --pmc FETCH_SIZE WRITE_SIZE \
                       -d "$CELL_DIR" \
                       -- torchrun --nnodes=1 --nproc-per-node="$NPROC" \
                          --rdzv_endpoint="localhost:$PORT" \
@@ -134,15 +137,18 @@ for S in "${SEQS[@]}"; do
             2>&1 | tee "$CELL_DIR/rocprof.log" || {
                 echo "  rocprofv3 run failed for S=$S B=$B (see log)"; continue; }
 
-        # rocprofv3 writes counter_collection.csv somewhere under -d; find it.
-        CC="$(find "$CELL_DIR" -name 'counter_collection.csv' 2>/dev/null | head -1)"
-        if [[ -z "$CC" ]]; then
-            echo "  no counter_collection.csv found under $CELL_DIR; skipping parse"
+        # rocprofv3 writes one <pid>_results.db PER RANK under -d (nested in a
+        # per-node subdir). SPX -> 1 db; CPX -> 8 dbs (one per XCD). The parser
+        # globs and merges all of them, so pass the whole cell dir.
+        NDB="$(find "$CELL_DIR" -name '*.db' 2>/dev/null | wc -l)"
+        if [[ "$NDB" -eq 0 ]]; then
+            echo "  no *.db found under $CELL_DIR; skipping parse"
             continue
         fi
+        echo "  found $NDB db file(s) for this cell"
 
         PYTHONPATH="$VLLM_SRC" python3 "$PARSER" \
-            --counter-csv "$CC" --mode "$MODE" \
+            --db-glob "$CELL_DIR/**/*.db" --mode "$MODE" \
             --seq-len "$S" --batch "$B" --out-csv "$CSV"
     done
 done
