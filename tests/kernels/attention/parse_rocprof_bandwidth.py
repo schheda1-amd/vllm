@@ -84,12 +84,25 @@ def parse_db(db_path, rd_counter, wr_counter, unit_bytes):
                 "rocpd_pmc_event is EMPTY -- counters not collected "
                 f"(non-KFD counters present: {names or '(none)'})")
 
+        # IMPORTANT: rocprofv3 arms PMC on EVERY agent the driver exposes,
+        # ignoring CUDA_VISIBLE_DEVICES. On a CPX node that's all 64 vGPUs (and
+        # on SPX all 8 physical GPUs), even though only the XCD(s) this rank
+        # actually used ran our kernels. So restrict to agents that BOTH are
+        # GPUs AND actually ran kernel dispatches in this db -- i.e. the device
+        # doing this workload. In each per-rank db that is exactly one XCD;
+        # across the 16 CPX dbs it is the 8 XCDs of the physical GPU.
         gpu_ids = _gpu_agent_ids(con)
+        dispatch_ids = {int(r[0]) for r in con.execute(
+            "SELECT DISTINCT agent_id FROM rocpd_kernel_dispatch")}
+        if gpu_ids:
+            work_ids = gpu_ids & dispatch_ids
+        else:
+            work_ids = dispatch_ids  # no agent-type info -> best effort
 
         def _gpu_filter(col):
-            if not gpu_ids:
-                return ""  # no agent info -> don't filter (best effort)
-            ids = ",".join(str(i) for i in sorted(gpu_ids))
+            if not work_ids:
+                return ""  # nothing identified -> don't filter (best effort)
+            ids = ",".join(str(i) for i in sorted(work_ids))
             return f" AND {col} IN ({ids})"
 
         # Counter bytes (KB -> bytes) for the counters present in this db.
