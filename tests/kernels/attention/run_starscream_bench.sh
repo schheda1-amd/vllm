@@ -75,7 +75,16 @@ BATCH_SIZES="${BATCH_SIZES:-1,8,32,64,128,256,512,1024}"
 CPX_SIZE="${CPX_SIZE:-8}"
 WARMUP="${WARMUP:-25}"
 ITERS="${ITERS:-200}"
-CSV="${CSV:-/workspace/vllm/bench_${MODEL}_${MODE}.csv}"
+# NUM_SEGMENTS: context segments for the 3D decode attention kernel (CPX
+# tuning). Default 16 (original). Set 1/2/4/8 to probe the batch-32/64 valley.
+# Only meaningful for the 3D-kernel regime (batch below the 2D switch).
+NUM_SEGMENTS="${NUM_SEGMENTS:-16}"
+# CSV name includes NUM_SEGMENTS when != 16 so tuning sweeps don't overwrite.
+if [[ "$NUM_SEGMENTS" == "16" ]]; then
+    CSV="${CSV:-/workspace/vllm/bench_${MODEL}_${MODE}.csv}"
+else
+    CSV="${CSV:-/workspace/vllm/bench_${MODEL}_${MODE}_seg${NUM_SEGMENTS}.csv}"
+fi
 # On-device signal-pad barrier (1) vs host dist.barrier (0). Only affects CPX.
 # In eager mode both are valid; SIGNAL_PAD=1 keeps RCCL off the merge path
 # (the point of step1/step2). Set SIGNAL_PAD=1 for the intended symm-mem runs.
@@ -136,6 +145,7 @@ echo "   head override: q=${Q_HEADS:-preset} kv=${KV_HEADS:-preset} head_size=${
 echo "   warmup/iters : $WARMUP / $ITERS"
 echo "   cuda_graph   : $CUDA_GRAPH   (1=graph replay, 0=eager)"
 echo "   signal_pad   : $SIGNAL_PAD   (CPX only)"
+echo "   num_segments : $NUM_SEGMENTS   (3D decode kernel)"
 echo "   csv          : $CSV"
 # Required hardware partition per launcher mode: spx -> SPX, cpx & cpx-baseline
 # -> CPX (both need the 8 XCDs visible).
@@ -151,6 +161,7 @@ if [[ "$BENCH_MODE" == "cpx" ]]; then
     PYTHONPATH="$VLLM_SRC" \
     TORCH_SYMM_MEM_DISABLE_MULTICAST=1 \
     VLLM_STARSCREAM_SIGNAL_PAD_BARRIER="$SIGNAL_PAD" \
+    VLLM_STARSCREAM_NUM_SEGMENTS="$NUM_SEGMENTS" \
     torchrun --nnodes=1 --nproc-per-node="$NPROC" \
         "$BENCH" --mode cpx --cpx-size "$CPX_SIZE" "${COMMON_ARGS[@]}"
 else
@@ -158,6 +169,7 @@ else
     # `cpx-baseline` (8 XCDs). No symm-mem env, no cpx-size.
     CUDA_VISIBLE_DEVICES="$DEVICES" \
     PYTHONPATH="$VLLM_SRC" \
+    VLLM_STARSCREAM_NUM_SEGMENTS="$NUM_SEGMENTS" \
     torchrun --nnodes=1 --nproc-per-node="$NPROC" \
         "$BENCH" --mode spx "${COMMON_ARGS[@]}"
 fi

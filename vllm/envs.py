@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_STARSCREAM_USE_SYMM_MEM: bool = False
     VLLM_STARSCREAM_FUSE_REDUCE: bool = False
     VLLM_STARSCREAM_SIGNAL_PAD_BARRIER: bool = False
+    VLLM_STARSCREAM_NUM_SEGMENTS: int = 16
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -1419,6 +1420,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # symm-mem allgather (step1) and the fused kernel (step2).
     "VLLM_STARSCREAM_SIGNAL_PAD_BARRIER": lambda: bool(
         int(os.getenv("VLLM_STARSCREAM_SIGNAL_PAD_BARRIER", "0"))
+    ),
+    # Starscream (CPX+NPS4): number of context segments for the 3D decode
+    # attention kernel. Default 16. In CPX each XCD holds only seq_len/cpx
+    # context, so 16 segments over that short slice produces tiny per-segment
+    # work (overhead-bound at mid batch). Lower it (e.g. 2/4/8) to fatten each
+    # segment and reduce workgroup oversubscription on the XCD's 38 CUs.
+    "VLLM_STARSCREAM_NUM_SEGMENTS": lambda: int(
+        os.getenv("VLLM_STARSCREAM_NUM_SEGMENTS", "16")
     ),
     # Allows vllm to find tuned config under customized folder
     "VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),

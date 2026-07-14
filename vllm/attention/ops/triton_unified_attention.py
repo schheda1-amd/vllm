@@ -993,8 +993,13 @@ def unified_attention(
         )
     else:
         # for initial version, NUM_SEGMENTS = 16 is chosen as a default
-        # value that showed good performance in tests
-        NUM_SEGMENTS = 16
+        # value that showed good performance in tests.
+        # Override via VLLM_STARSCREAM_NUM_SEGMENTS for CPX tuning: in CPX each
+        # XCD only holds seq_len/cpx context, so 16 segments over that short
+        # context yields tiny per-segment work (overhead-bound). Lowering it
+        # fattens each segment. Default 16 preserves original behavior.
+        import vllm.envs as envs
+        NUM_SEGMENTS = envs.VLLM_STARSCREAM_NUM_SEGMENTS
 
         segm_output = torch.empty(
             q.shape[0],
