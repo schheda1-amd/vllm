@@ -63,10 +63,10 @@ if [[ "$MODEL" != "llama3-70b" && "$MODEL" != "llama3-405b" \
 fi
 
 VLLM_SRC="${VLLM_SRC:-/workspace/vllm}"
-SEQ_LENS="${SEQ_LENS:-256,8192,131072}"
+SEQ_LENS="${SEQ_LENS:-16384,32768,65536}"
 # Output-token offsets added to each base seq-len (KV grows as tokens generate).
-# Default 0 = single snapshot. E.g. TOKEN_OFFSETS=0,64,128,192,256 samples the
-# first 257 output tokens and reports per-output-token attention latency.
+# Default 0 = single snapshot (no offset sweep). E.g. TOKEN_OFFSETS=0,64,128
+# would sample per-output-token latency; 0 disables that.
 TOKEN_OFFSETS="${TOKEN_OFFSETS:-0}"
 BATCH_SIZES="${BATCH_SIZES:-1,8,32,64,128,256,512,1024}"
 # Head shapes come from the model preset (--model), applied by the benchmark.
