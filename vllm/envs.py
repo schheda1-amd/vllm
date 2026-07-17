@@ -207,6 +207,8 @@ if TYPE_CHECKING:
     VLLM_STARSCREAM_SIGNAL_PAD_BARRIER: bool = False
     VLLM_STARSCREAM_NUM_SEGMENTS: int = 16
     VLLM_STARSCREAM_FORCE_2D: bool = False
+    VLLM_STARSCREAM_BLOCK_Q: int = 0
+    VLLM_STARSCREAM_TILE_SIZE: int = 0
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -1437,6 +1439,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # segment dim, no reduce_segments) may tile better there. Default off.
     "VLLM_STARSCREAM_FORCE_2D": lambda: bool(
         int(os.getenv("VLLM_STARSCREAM_FORCE_2D", "0"))
+    ),
+    # Starscream (CPX+NPS4) 3D-kernel tiling overrides for the QKt/PV GEMMs.
+    # 0 = use the default derivation. BLOCK_Q packs more query tokens per
+    # threadblock -> BLOCK_M = BLOCK_Q * num_queries_per_kv grows toward the MFMA
+    # sweet spot (M>=64). TILE_SIZE sets the key-tile (GEMM-1 N / GEMM-2 K).
+    # Combined with NUM_SEGMENTS, these size the split-KV grid to the XCD's 38
+    # CUs with fatter, matrix-engine-friendly tiles. Only affect the 3D kernel.
+    "VLLM_STARSCREAM_BLOCK_Q": lambda: int(
+        os.getenv("VLLM_STARSCREAM_BLOCK_Q", "0")
+    ),
+    "VLLM_STARSCREAM_TILE_SIZE": lambda: int(
+        os.getenv("VLLM_STARSCREAM_TILE_SIZE", "0")
     ),
     # Allows vllm to find tuned config under customized folder
     "VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),

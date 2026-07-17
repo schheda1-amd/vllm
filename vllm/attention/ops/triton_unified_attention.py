@@ -891,6 +891,17 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
+    # Starscream 3D-kernel tiling override (CPX tuning). BLOCK_Q packs more query
+    # tokens per threadblock; BLOCK_M must stay = BLOCK_Q * num_queries_per_kv
+    # (the kernel derives its query rows that way). Grid total_num_q_blocks then
+    # shrinks as BLOCK_Q grows -> fewer, fatter threadblocks. Only on starscream.
+    if enable_starscream:
+        import vllm.envs as _ss_envs
+        _bq = _ss_envs.VLLM_STARSCREAM_BLOCK_Q
+        if _bq > 0:
+            BLOCK_Q = _bq
+            BLOCK_M = BLOCK_Q * num_queries_per_kv
+
     if enable_starscream:
         outd = torch.empty(
             q.shape[0],
@@ -929,6 +940,15 @@ def unified_attention(
     # and at least 16 for all other data types.
     TILE_SIZE_PREFILL = 32
     TILE_SIZE_DECODE = 16 if q.element_size() >= 2 else 32
+
+    # Starscream 3D-kernel key-tile override (CPX tuning): sets GEMM-1's N and
+    # GEMM-2's contraction K. Larger -> fatter K/V loads, fewer loop iters. Only
+    # on starscream; must stay >= 32 for fp8 (q.element_size()==1), >= 16 else.
+    if enable_starscream:
+        import vllm.envs as _ss_envs2
+        _ts = _ss_envs2.VLLM_STARSCREAM_TILE_SIZE
+        if _ts > 0:
+            TILE_SIZE_DECODE = _ts
 
     # Experimental: force the 2D kernel even at decode/small-batch. Only takes
     # effect on the starscream path (enable_starscream); the 2D kernel already
