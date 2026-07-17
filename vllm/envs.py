@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     VLLM_STARSCREAM_FUSE_REDUCE: bool = False
     VLLM_STARSCREAM_SIGNAL_PAD_BARRIER: bool = False
     VLLM_STARSCREAM_NUM_SEGMENTS: int = 16
+    VLLM_STARSCREAM_FORCE_2D: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
@@ -1428,6 +1429,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # segment and reduce workgroup oversubscription on the XCD's 38 CUs.
     "VLLM_STARSCREAM_NUM_SEGMENTS": lambda: int(
         os.getenv("VLLM_STARSCREAM_NUM_SEGMENTS", "16")
+    ),
+    # Starscream (CPX+NPS4): force the 2D attention kernel even in the decode /
+    # small-batch regime where the selection heuristic would pick the 3D
+    # (segmented) kernel. Experimental: the 3D kernel's NUM_SEGMENTS fan-out is
+    # inefficient on a single XCD's 38 CUs at mid batch; the 2D kernel (no
+    # segment dim, no reduce_segments) may tile better there. Default off.
+    "VLLM_STARSCREAM_FORCE_2D": lambda: bool(
+        int(os.getenv("VLLM_STARSCREAM_FORCE_2D", "0"))
     ),
     # Allows vllm to find tuned config under customized folder
     "VLLM_TUNED_CONFIG_FOLDER": lambda: os.getenv("VLLM_TUNED_CONFIG_FOLDER", None),

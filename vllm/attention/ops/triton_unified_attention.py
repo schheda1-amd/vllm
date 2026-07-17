@@ -930,8 +930,16 @@ def unified_attention(
     TILE_SIZE_PREFILL = 32
     TILE_SIZE_DECODE = 16 if q.element_size() >= 2 else 32
 
+    # Experimental: force the 2D kernel even at decode/small-batch. Only takes
+    # effect on the starscream path (enable_starscream); the 2D kernel already
+    # writes starscream_meta_out with the same layout the merge consumes, and at
+    # decode (cur_batch_query_len==1) its context-split logic matches the 3D
+    # kernel, so the merge tail is fed identically.
+    import vllm.envs as envs
+    force_2d = enable_starscream and envs.VLLM_STARSCREAM_FORCE_2D
+
     # if batch contains a prefill
-    if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
+    if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128 or force_2d:
         kernel_unified_attention_2d[
             (
                 total_num_q_blocks,
