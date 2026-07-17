@@ -52,8 +52,8 @@ SIGNAL_PAD="${SIGNAL_PAD:-1}"          # only relevant to symm-mem variants
 NUM_SEGMENTS="${NUM_SEGMENTS:-16}"
 PROFILE_ITERS="${PROFILE_ITERS:-30}"
 TS="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${OUT_DIR:-/workspace/vllm/ktime_${MODEL}_${MODE}_${TS}}"
-CSV="${CSV:-/workspace/vllm/ktime_${MODEL}_${MODE}.csv}"
+# OUT_DIR / CSV are finalized AFTER PROFILE_VARIANT is resolved (below), so the
+# variant is in the filename and step2 never overwrites the rccl trace.
 
 BENCH="${VLLM_SRC}/tests/kernels/attention/bench_starscream_attention.py"
 
@@ -63,14 +63,38 @@ BENCH="${VLLM_SRC}/tests/kernels/attention/bench_starscream_attention.py"
 #   cpx-baseline : 8 XCDs, bench --mode spx (starscream OFF), variant spx
 if [[ "$MODE" == "spx" ]]; then
     DEVICES="${DEVICES:-0}"; NPROC=1; BENCH_MODE="spx"
-    PROFILE_VARIANT="spx"; HW_PART="SPX"
+    PROFILE_VARIANT="${PROFILE_VARIANT:-spx}"; HW_PART="SPX"
 elif [[ "$MODE" == "cpx" ]]; then
     DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"; NPROC="$CPX_SIZE"; BENCH_MODE="cpx"
-    PROFILE_VARIANT="rccl"; HW_PART="CPX"
+    # Default rccl (separable AG + reduce_segments). Override with
+    # PROFILE_VARIANT=step2 to trace the fused path.
+    PROFILE_VARIANT="${PROFILE_VARIANT:-rccl}"; HW_PART="CPX"
 else  # cpx-baseline
     DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"; NPROC="$CPX_SIZE"; BENCH_MODE="spx"
-    PROFILE_VARIANT="spx"; HW_PART="CPX"
+    PROFILE_VARIANT="${PROFILE_VARIANT:-spx}"; HW_PART="CPX"
 fi
+
+# ---------------------------------------------------------------------------
+# NCCL kernel bucket -- what the `collective` bucket contains per variant:
+#   rccl : query-AG (grp.all_gather(q_local) in _attention_call, ALWAYS rccl)
+#          + meta-AG (get_dcp_group().all_gather of the reduce meta tensor).
+#          => 2 nccl dispatches per iter.
+#   step2: the meta-AG is FUSED into the Triton _fused_allgather_reduce_kernel
+#          (peer reads, no nccl), so the ONLY nccl kernel left is the query-AG.
+#          => 1 nccl dispatch per iter -- collective bucket == query-AG cost.
+# Therefore:  meta-AG cost = rccl.collective - step2.collective  (query-AG is
+# common to both). CRITICAL: step2 MUST run with SIGNAL_PAD=1, else the merge
+# barrier is a host dist.barrier (an nccl collective) and pollutes the bucket.
+if [[ "$PROFILE_VARIANT" == "step2" ]]; then
+    if [[ "${SIGNAL_PAD}" != "1" ]]; then
+        echo "  [note] forcing SIGNAL_PAD=1 for step2 (keeps nccl bucket == query-AG only)"
+        SIGNAL_PAD=1
+    fi
+fi
+
+# Filenames carry the variant so step2 traces never overwrite the rccl ones.
+OUT_DIR="${OUT_DIR:-/workspace/vllm/ktime_${MODEL}_${MODE}_${PROFILE_VARIANT}_${TS}}"
+CSV="${CSV:-/workspace/vllm/ktime_${MODEL}_${MODE}_${PROFILE_VARIANT}.csv}"
 
 # Optional per-dimension head overrides (else --model preset wins).
 HEAD_ARGS=()
@@ -183,34 +207,43 @@ for db in dbs:
     cols=[r[1] for r in con.execute(f'PRAGMA table_info("{ksym}")')]
     ncol=next((c for c in ("kernel_name","formatted_kernel_name","display_name","name") if c in cols),None)
     icol=next((c for c in ("id","kernel_id") if c in cols),None)
-    b={}
-    q=(f'SELECT ks."{ncol}", SUM(kd."end"-kd.start) '
+    b={}; b["_nccl_disp"]=0
+    q=(f'SELECT ks."{ncol}", SUM(kd."end"-kd.start), COUNT(*) '
        f'FROM {disp} kd JOIN {ksym} ks ON kd.kernel_id=ks."{icol}" '
        f'GROUP BY ks."{ncol}"')
-    for name,tot in con.execute(q):
-        b[bucket(name)]=b.get(bucket(name),0.0)+float(tot or 0.0)
+    for name,tot,cnt in con.execute(q):
+        bk=bucket(name)
+        b[bk]=b.get(bk,0.0)+float(tot or 0.0)
+        if bk=="collective":
+            b["_nccl_disp"]+=int(cnt or 0)
     per_db.append(b); con.close()
 
 buckets=["attention","collective","merge","barrier","setup","other"]
 agg={k:0.0 for k in buckets}
 for k in buckets:
     agg[k]=max((d.get(k,0.0) for d in per_db), default=0.0)  # max across ranks
+# nccl dispatches PER ITER on the busiest rank (rccl->~2, step2->~1). Validates
+# that the collective bucket is isolated to query-AG for step2.
+max_nccl=max((d.get("_nccl_disp",0) for d in per_db), default=0)
+nccl_per_iter = (max_nccl/iters) if iters else 0
 # per-iter (ns) -> us
 def us(x): return (x/iters)/1e3
 total_us=sum(us(agg[k]) for k in buckets)
 
 hdr=("mode,variant,seq_len,batch,n_dbs,"
-     "attention_us,collective_us,merge_us,barrier_us,setup_us,other_us,total_us\n")
+     "attention_us,collective_us,merge_us,barrier_us,setup_us,other_us,total_us,"
+     "nccl_disp_per_iter\n")
 newf=not os.path.exists(out)
 with open(out,"a") as f:
     if newf: f.write(hdr)
     f.write(f"{mode},{variant},{seq},{batch},{len(per_db)},"
             f"{us(agg['attention']):.3f},{us(agg['collective']):.3f},"
             f"{us(agg['merge']):.3f},{us(agg['barrier']):.3f},"
-            f"{us(agg['setup']):.3f},{us(agg['other']):.3f},{total_us:.3f}\n")
+            f"{us(agg['setup']):.3f},{us(agg['other']):.3f},{total_us:.3f},"
+            f"{nccl_per_iter:.2f}\n")
 print(f"  [ktime] attn={us(agg['attention']):.1f} coll={us(agg['collective']):.1f} "
       f"merge={us(agg['merge']):.1f} barrier={us(agg['barrier']):.1f} us "
-      f"(per iter, max over {len(per_db)} ranks)")
+      f"nccl/iter={nccl_per_iter:.1f} (max over {len(per_db)} ranks)")
 PYEOF
     done
 done
