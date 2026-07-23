@@ -6,11 +6,13 @@
 #
 # Decode attention is memory-bound, so achieved HBM bandwidth is the metric of
 # record: higher aggregate bandwidth correlates with better runtime. This script
-# runs the benchmark in --profile mode under rocprofv3, collecting the
-# memory-controller request counters (TCC_EA_RDREQ / TCC_EA_WRREQ) plus kernel
+# runs the benchmark in --profile mode under rocprofv3, collecting the derived
+# HBM-interface size counters (FETCH_SIZE / WRITE_SIZE, in KB) plus kernel
 # durations, for each (seq_len, batch) cell -- ORIGINAL seq-len shapes only, no
-# token offsets. It then computes:
-#     bytes = (RDREQ + WRREQ) * 64                       # 64B EA line
+# token offsets. FETCH_SIZE and WRITE_SIZE each expand to several base TCC
+# counters, so they are collected in SEPARATE --pmc passes (see below). It then
+# computes:
+#     bytes = (FETCH_SIZE + WRITE_SIZE) * 1024           # KB -> bytes
 #     BW    = bytes / kernel_busy_time                   # GB/s
 #   SPX: single rank's BW.  CPX: SUM over the 8 XCDs (concurrent) = aggregate.
 #
