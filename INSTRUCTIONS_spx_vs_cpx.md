@@ -15,12 +15,15 @@ DOCKER_BUILDKIT=1 docker build --network=host \
   --target final -t vllm-rocm:starscream .
 ```
 
+Or optionally, use a prebuilt image like `rocm/vllm:rocm7.13.0_gfx94X-dcgpu_ubuntu24.04_py3.13_pytorch_2.10.0_vllm_0.19.1`.
+
 ## 2. Start the container
+(from the repo root)
 
 ```bash
 docker run --rm -it --network=host \
   --device=/dev/kfd --device=/dev/dri --group-add video \
-  --security-opt seccomp=unconfined --shm-size=16g \
+  --security-opt seccomp=unconfined --shm-size=128g \
   -v $(pwd):/workspace/vllm -w /workspace/vllm \
   vllm-rocm:starscream bash
 ```
