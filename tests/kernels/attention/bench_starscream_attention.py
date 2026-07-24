@@ -461,6 +461,10 @@ def main():
                    help="Force eager-mode timing.")
     p.add_argument("--csv", type=str, default="",
                    help="Optional path to write CSV results (rank 0)")
+    p.add_argument("--variants", type=str, default=None,
+                   help="Comma list of CPX merge variants to time "
+                        "(subset of rccl,step1,step2). Default: all three. "
+                        "Ignored in spx mode.")
     p.add_argument("--skip-sanity", action="store_true",
                    help="Skip the pre-sweep sanity check")
     p.add_argument("--sanity-seq-len", type=int, default=8192,
@@ -555,7 +559,15 @@ def main():
     seq_lens = [int(x) for x in args.seq_lens.split(",")]
     token_offsets = sorted(int(x) for x in args.token_offsets.split(","))
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
-    variants = ["rccl", "step1", "step2"] if args.mode == "cpx" else ["spx"]
+    if args.mode == "cpx":
+        variants = ["rccl", "step1", "step2"]
+        if args.variants:
+            want = [v.strip() for v in args.variants.split(",") if v.strip()]
+            bad = [v for v in want if v not in variants]
+            assert not bad, f"unknown --variants {bad}; pick from {variants}"
+            variants = want
+    else:
+        variants = ["spx"]
 
     # --- Pre-sweep sanity check: run one small cell end-to-end so a broken
     # harness (bad shapes, symm-mem unavailable, collective hang) fails fast
