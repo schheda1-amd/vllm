@@ -15,7 +15,7 @@ from functools import cache
 from types import ModuleType
 from typing import Any
 
-import regex as re
+import re
 from typing_extensions import Never
 
 

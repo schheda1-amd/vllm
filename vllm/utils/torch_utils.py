@@ -14,6 +14,7 @@ import torch
 from packaging import version
 from packaging.version import Version
 from torch.library import Library
+import random
 
 import vllm.envs as envs
 
@@ -148,6 +149,16 @@ def common_broadcastable_dtype(dtypes: Collection[torch.dtype]):
         dtypes,
         key=lambda dtype: sum(is_lossless_cast(dt, dtype) for dt in dtypes),
     )
+
+
+def set_random_seed(seed: int | None) -> None:
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        from vllm.platforms import current_platform
+
+        current_platform.manual_seed_all(seed)
 
 
 def _generate_random_fp8(
