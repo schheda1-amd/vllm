@@ -50,6 +50,20 @@ CONFIGS = [
 ]
 
 
+def _select_configs(only: list[str] | None):
+    """Resolve --only into a config list, or fall back to the full sweep."""
+    if not only:
+        return CONFIGS
+    picked = []
+    for spec in only:
+        try:
+            s, b = (int(x) for x in spec.split(","))
+        except ValueError:
+            raise SystemExit(f"--only expects SEQLEN,BATCH (got {spec!r})")
+        picked.append((s, b))
+    return picked
+
+
 @torch.inference_mode()
 def benchmark_config(
     num_seqs: int,
@@ -214,10 +228,20 @@ def main():
              "test_harness_1_paged_cpx.py, or the two runs use different KV "
              "scatter patterns and the comparison is not apples-to-apples."
     )
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="SEQLEN,BATCH",
+        help="Run only this (seq_len, batch) cell instead of the full sweep. "
+             "Repeatable. Used by the rocprof drivers so the profiled path is "
+             "the benchmarked path, not a separate launcher that can drift.",
+    )
     args = parser.parse_args()
 
     if args.num_query_heads % args.num_kv_heads != 0:
         raise ValueError("num_query_heads must be divisible by num_kv_heads")
+
+    configs = _select_configs(args.only)
 
     dtype = STR_DTYPE_TO_TORCH_DTYPE[args.dtype]
     kv_cache_dtype = args.kv_cache_dtype
@@ -232,7 +256,7 @@ def main():
     print("-" * 50)
 
     results = []
-    for seq_len, batch_size in CONFIGS:
+    for seq_len, batch_size in configs:
         try:
             r = benchmark_config(
                 num_seqs=batch_size,

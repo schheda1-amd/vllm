@@ -89,6 +89,25 @@ CHECK_CONFIGS = [
 ]
 
 
+def _select_configs(only: list[str] | None):
+    """Resolve --only into a config list, or fall back to the full sweep.
+
+    Every rank parses the same argv, so the resulting list is identical
+    everywhere -- which it must be, since the ranks walk configs in lockstep
+    and the symm-mem buffer cache is keyed on the per-config numel.
+    """
+    if not only:
+        return CONFIGS
+    picked = []
+    for spec in only:
+        try:
+            s, b = (int(x) for x in spec.split(","))
+        except ValueError:
+            raise SystemExit(f"--only expects SEQLEN,BATCH (got {spec!r})")
+        picked.append((s, b))
+    return picked
+
+
 class ShimGroup:
     """Minimal stand-in for vLLM's DCP ``GroupCoordinator``.
 
@@ -499,11 +518,20 @@ def main():
              "every head (world x redundant); fused merge only.",
     )
     parser.add_argument(
+        "--only",
+        action="append",
+        metavar="SEQLEN,BATCH",
+        help="Run only this (seq_len, batch) cell instead of the full sweep. "
+             "Repeatable. Used by the rocprof drivers so the profiled path is "
+             "the benchmarked path, not a separate launcher that can drift.",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="validate the merged output against a full-context single-rank run",
     )
     args = parser.parse_args()
+    configs = _select_configs(args.only)
 
     if args.num_query_heads % args.num_kv_heads != 0:
         raise ValueError("num_query_heads must be divisible by num_kv_heads")
@@ -648,7 +676,7 @@ def main():
         print("-" * 50)
 
     results = []
-    for seq_len, batch_size in CONFIGS:
+    for seq_len, batch_size in configs:
         err = None
         r = None
         try:
