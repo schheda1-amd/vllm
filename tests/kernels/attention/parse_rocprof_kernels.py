@@ -74,6 +74,54 @@ _TEMPLATE_ARGS = re.compile(r"<.*>", re.DOTALL)
 # Leading <length><identifier> component of an Itanium mangled name.
 _MANGLED_PART = re.compile(r"(\d+)")
 
+# What a decoded mangled component must look like to be believed.
+_IDENT = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+
+# One source of truth for the CSV schema: --out-csv writes it, --compare reads
+# it. SPX and CPX cannot be profiled in one boot of the compute partition, so
+# this file is APPENDED to across runs that may be days and a parser revision
+# apart. Both ends therefore check the header rather than trusting it.
+CSV_HEADER = (
+    "label,seq_len,batch,kernel,n_ranks,n_dispatch,"
+    "total_max_ns,total_mean_ns,med_ns_per_dispatch,max_ns_per_dispatch"
+)
+
+# The schema written before per-dispatch medians were carried. Recognised only
+# so the error can name it -- its rows are deliberately NOT auto-migrated. The
+# old ns_per_dispatch is a MEAN, and a mean over dispatches is exactly the
+# statistic one out-of-loop barrier of ~100 ms wrecks; silently sliding it into
+# the median column would produce a table that looks fine and is wrong.
+_LEGACY_HEADER = (
+    "label,seq_len,batch,kernel,n_ranks,n_dispatch,max_ns,mean_ns,ns_per_dispatch"
+)
+
+
+def _csv_header_of(path: str) -> str:
+    with open(path) as f:
+        return f.readline().strip()
+
+
+def _schema_error(path: str, found: str) -> SystemExit:
+    what = (
+        "the schema of an older parser revision"
+        if found == _LEGACY_HEADER
+        else "an unrecognised schema"
+    )
+    return SystemExit(
+        f"ERROR: {path} has {what}.\n"
+        f"  found:    {found}\n"
+        f"  expected: {CSV_HEADER}\n"
+        "\n"
+        "These rows are not auto-converted: the old ns_per_dispatch column is a\n"
+        "mean, not the median this parser reports, so reusing it would silently\n"
+        "change what the table means. Delete the CSV and re-parse the .db files\n"
+        "already on disk -- this costs no re-profiling and no partition flip:\n"
+        f"  rm -f {path}\n"
+        "  ./run_paged_kerntime.sh reparse kern_spx_<ts> spx\n"
+        "  ./run_paged_kerntime.sh reparse kern_cpx_<ts> cpx\n"
+        "  ./run_paged_kerntime.sh compare"
+    )
+
 
 def _demangle(name: str) -> str:
     """Recover the top-level identifier from an Itanium-mangled symbol.
@@ -101,11 +149,25 @@ def _demangle(name: str) -> str:
         while j < len(n) and n[j].isdigit():
             j += 1
         ln = int(n[i:j])
-        parts.append(n[j : j + ln])
+        if ln == 0 or len(n) - j < ln:  # length prefix overruns the string
+            return name
+        part = n[j : j + ln]
+        if not _IDENT.fullmatch(part):
+            return name
+        parts.append(part)
         i = j + ln
         if not nested:  # free function: one component, the rest is arg types
             break
-    return parts[-1] if parts else n
+    if not parts:
+        return name
+    # A nested name must close with 'E'. Landing anywhere else means a length
+    # prefix was misread and the "identifier" is a fragment of the neighbouring
+    # component -- returning that fragment is worse than not decoding at all,
+    # because the spin/collective regex matches on this string and a truncated
+    # name silently reclassifies a peer-wait barrier as work.
+    if nested and not n.startswith("E", i):
+        return name
+    return parts[-1]
 
 
 def _short_name(name: str) -> str:
@@ -266,6 +328,14 @@ def compare(in_csv: str, base: str, other: str, spin_re: str):
     import csv as _csv
 
     spin = re.compile(spin_re, re.I) if spin_re else None
+
+    if not os.path.exists(in_csv) or os.path.getsize(in_csv) == 0:
+        raise SystemExit(
+            f"ERROR: {in_csv} is missing or empty -- run the spx and cpx passes first"
+        )
+    header = _csv_header_of(in_csv)
+    if header != CSV_HEADER:
+        raise _schema_error(in_csv, header)
 
     # (S, B) -> kernel -> label -> (med_ns, total_ns)
     cells: dict[tuple[int, int], dict[str, dict[str, tuple]]] = defaultdict(
@@ -466,14 +536,18 @@ def main():
               "(and, for an out-of-loop collective, by rank skew), not by work")
 
     if args.out_csv:
-        write_header = not os.path.exists(args.out_csv)
+        # Append, so check the existing header BEFORE writing: appending
+        # 10-field rows under a 9-field header corrupts the file quietly and
+        # the failure only shows up later, in --compare, as a KeyError.
+        # Treat a zero-byte file as absent (an interrupted earlier run).
+        have = os.path.exists(args.out_csv) and os.path.getsize(args.out_csv) > 0
+        if have:
+            header = _csv_header_of(args.out_csv)
+            if header != CSV_HEADER:
+                raise _schema_error(args.out_csv, header)
         with open(args.out_csv, "a") as f:
-            if write_header:
-                f.write(
-                    "label,seq_len,batch,kernel,n_ranks,n_dispatch,"
-                    "total_max_ns,total_mean_ns,med_ns_per_dispatch,"
-                    "max_ns_per_dispatch\n"
-                )
+            if not have:
+                f.write(CSV_HEADER + "\n")
             for name, nranks, n, mx, mean, med, dmax, _ in rows:
                 safe = name.replace(",", ";")
                 f.write(
