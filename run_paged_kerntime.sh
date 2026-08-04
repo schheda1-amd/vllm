@@ -54,6 +54,26 @@ if [[ "$MODE" == "compare" ]]; then
     exec python3 "$PARSER" --compare --in-csv "$CSV"
 fi
 
+# Re-parse dbs that are already on disk -- the trace is the expensive part and
+# it does not change when the parser does, so a tooling fix must not cost
+# another partition flip and another profiling run.
+#   ./run_paged_kerntime.sh reparse kern_spx_2026.../ spx
+if [[ "$MODE" == "reparse" ]]; then
+    DIR="${1:?usage: reparse <out_dir> <label>}"; LBL="${2:?usage: reparse <out_dir> <label>}"
+    found=0
+    for CELL_DIR in "$DIR"/S*_B*; do
+        [[ -d "$CELL_DIR" ]] || continue
+        CELL="$(basename "$CELL_DIR")"; S="${CELL#S}"; S="${S%%_B*}"; B="${CELL##*_B}"
+        find "$CELL_DIR" -name '*.db' -print -quit | grep -q . || continue
+        found=1
+        python3 "$PARSER" --db-glob "$CELL_DIR/**/*.db" \
+            --label "$LBL" --seq-len "$S" --batch "$B" \
+            --top "$TOP" --out-csv "$CSV" "${RAW_ARG[@]}"
+    done
+    [[ "$found" -eq 1 ]] || { echo "ERROR: no S*_B*/**.db under $DIR" >&2; exit 1; }
+    exit 0
+fi
+
 [[ -f "$PARSER" ]] || { echo "ERROR: missing $PARSER" >&2; exit 1; }
 command -v rocprofv3 >/dev/null || { echo "ERROR: rocprofv3 not on PATH" >&2; exit 1; }
 

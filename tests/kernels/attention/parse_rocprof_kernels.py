@@ -16,16 +16,38 @@ Uses --kernel-trace, NOT --pmc. Three reasons that matter here:
     excludes (the spin-wait barrier, RCCL, cache fills) -- their cost is exactly
     what is in question.
 
-Aggregation
------------
+Aggregation, and why the headline is not a sum
+----------------------------------------------
 Ranks on one physical GPU run concurrently, so per-kernel times are reduced
 across ranks with MAX, not SUM -- the same convention the CPX harness uses for
 step latency (the slowest XCD sets the step time). SUM across ranks would
-report 8 XCDs' concurrent work as if it were serial. The mean is printed
-alongside so a skewed rank is visible rather than hidden behind the max.
+report 8 XCDs' concurrent work as if it were serial.
 
   SPX : 1 db  -> max == mean == the single rank's total
   CPX : 8 dbs -> one per XCD rank
+
+But *summing those per-kernel maxes* is not the step time either, and getting
+that wrong is easy: while rank A runs its QKV kernel, rank B is parked in the
+signal-pad barrier waiting for it. Taking the max of QKV across ranks AND the
+max of the barrier across ranks counts that wait twice -- once as work, once as
+waiting for the same work. So the headline is the max over ranks of each rank's
+OWN total busy time, which cannot double-count by construction; the sum of
+per-kernel maxes is printed beside it, and a large gap between the two is
+itself the rank-skew signal.
+
+For the same reason a "busy excluding spin/collective" line is printed. Time in
+``signal_pad_barrier`` / ``ncclDevKernel`` is overwhelmingly *waiting on a
+peer*, plus -- for a collective outside the timed loop -- waiting for the
+slowest rank to finish the entire benchmark. It is real GPU occupancy and real
+wall clock, but it is not this rank's work, so it belongs on its own line
+rather than folded into a per-kernel cost comparison.
+
+Per-dispatch median, not just the total
+---------------------------------------
+Totals mix warmup, one-time setup (KV-cache fill, RNG) and the steady state.
+A single end-of-run barrier that spins for 100 ms is one dispatch out of ~46
+and would swamp a mean. The median per dispatch is what maps onto the harness's
+reported us/step, so it is the column the compare view leads with.
 """
 
 from __future__ import annotations
@@ -37,6 +59,65 @@ import re
 import sqlite3
 import sys
 from collections import defaultdict
+
+# Collapse C++ template instantiations to something readable: the reduce kernel
+# appears as paged_attention_ll4mi_reduce_kernel<__hip_bfloat16, ..., 8> and the
+# NPAR_LOOPS value in that parameter list is precisely what we may end up
+# changing, so keep the template args in a --raw dump but strip them by default.
+#
+# Stripping is not cosmetic here. SPX at 131072 instantiates NPAR_LOOPS=8 and
+# CPX instantiates NPAR_LOOPS=1, so with the args kept the same kernel lands on
+# two different rows of the compare table and reads as "SPX-only" and
+# "CPX-only" instead of as the one row whose delta is the whole question.
+_TEMPLATE_ARGS = re.compile(r"<.*>", re.DOTALL)
+
+# Leading <length><identifier> component of an Itanium mangled name.
+_MANGLED_PART = re.compile(r"(\d+)")
+
+
+def _demangle(name: str) -> str:
+    """Recover the top-level identifier from an Itanium-mangled symbol.
+
+    rocprofv3 builds differ in whether the kernel-symbol table carries a
+    demangled column at all; when it does not, every row reads as
+    ``_Z35paged_attention_ll4mi_reduce_kernelI...`` and the template-arg strip
+    below is a no-op because there is no ``<`` to strip. Rather than shell out
+    to c++filt per row, decode just the name prefix -- ``_Z<len><name>`` for a
+    free function, ``_ZN<len><ns><len><name>...E`` for a nested one -- which is
+    all this tool ever displays. Anything unrecognised is returned unchanged.
+    """
+    n = name
+    if n.endswith(".kd"):  # kernel-descriptor symbol, e.g. Triton's .kd suffix
+        n = n[:-3]
+    if not n.startswith("_Z"):
+        return n
+    i = 2
+    nested = i < len(n) and n[i] == "N"
+    if nested:
+        i += 1
+    parts = []
+    while i < len(n) and n[i].isdigit():
+        j = i
+        while j < len(n) and n[j].isdigit():
+            j += 1
+        ln = int(n[i:j])
+        parts.append(n[j : j + ln])
+        i = j + ln
+        if not nested:  # free function: one component, the rest is arg types
+            break
+    return parts[-1] if parts else n
+
+
+def _short_name(name: str) -> str:
+    n = _demangle(name)
+    n = n.split("(")[0]
+    n = _TEMPLATE_ARGS.sub("", n)
+    return n.strip().split("::")[-1] or name
+
+
+# Kernels whose duration is dominated by waiting on a peer rather than by work.
+# Reported separately from the busy total; see the module docstring.
+_SPIN_DEFAULT = r"signal_pad_barrier|ncclDevKernel|ncclKernel|rccl"
 
 
 def _resolve(con, *candidates):
@@ -62,6 +143,13 @@ def _resolve(con, *candidates):
 
 
 def _kernel_name_id_cols(con, ksym):
+    """Pick the name column, preferring an already-demangled one.
+
+    Order matters: ``kernel_name`` is mangled in the rocprofv3 builds seen here,
+    so probing it first yields ``_Z35...`` for every row and defeats the
+    template-arg strip. Try the demangled/formatted columns first and fall back
+    to the mangled one, which :func:`_demangle` can still make readable.
+    """
     if not ksym:
         return None, None
     cols = [r[1] for r in con.execute(f'PRAGMA table_info("{ksym}")')]
@@ -69,10 +157,10 @@ def _kernel_name_id_cols(con, ksym):
         (
             c
             for c in (
-                "kernel_name",
                 "formatted_kernel_name",
-                "display_name",
                 "demangled_kernel_name",
+                "display_name",
+                "kernel_name",
                 "name",
             )
             if c in cols
@@ -96,26 +184,26 @@ def _gpu_agent_ids(con):
     return ids
 
 
-# Collapse C++ template instantiations to something readable: the reduce kernel
-# appears as paged_attention_ll4mi_reduce_kernel<__hip_bfloat16, ..., 1> and the
-# NPAR_LOOPS/JCHUNK value in that parameter list is precisely what we may end up
-# changing, so keep the template args in a --raw dump but strip them by default.
-_TEMPLATE_ARGS = re.compile(r"<.*>", re.DOTALL)
-
-
-def _short_name(name: str) -> str:
-    n = name.split("(")[0]
-    n = _TEMPLATE_ARGS.sub("", n)
-    return n.strip().split("::")[-1] or name
+def _median(xs):
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
 def parse_db(db_path: str, raw: bool):
-    """Return {kernel_name: [n_dispatches, total_ns]} for the busiest GPU agent.
+    """Return ({kernel: (n, total_ns, median_ns, max_ns)}, rank_busy_ns).
 
     One db can hold several agents (rocprof sees every device the process
     touched). Under torchrun each rank's process drives one XCD, so keying on
     the agent with the most kernel time picks that rank's device and drops
     idle ones.
+
+    Durations come back per dispatch rather than pre-SUMmed: the median is the
+    steady-state per-step cost, and a total alone cannot distinguish "expensive
+    every step" from "one 100 ms outlier at the end".
     """
     con = sqlite3.connect(db_path)
     try:
@@ -134,77 +222,111 @@ def parse_db(db_path: str, raw: bool):
             )
 
         rows = con.execute(
-            f'SELECT kd.agent_id, ks."{name_col}", COUNT(*), '
-            f'SUM(kd."end" - kd.start) '
+            f'SELECT kd.agent_id, ks."{name_col}", (kd."end" - kd.start) '
             f"FROM rocpd_kernel_dispatch kd "
-            f'JOIN {ksym} ks ON kd.kernel_id = ks."{id_col}"'
-            + agent_filter
-            + f' GROUP BY kd.agent_id, ks."{name_col}"'
+            f'JOIN {ksym} ks ON kd.kernel_id = ks."{id_col}"' + agent_filter
         ).fetchall()
         if not rows:
             raise RuntimeError("no kernel dispatches recorded")
 
         per_agent: dict[int, dict[str, list]] = defaultdict(
-            lambda: defaultdict(lambda: [0, 0.0])
+            lambda: defaultdict(list)
         )
-        for aid, name, n, total in rows:
+        for aid, name, dur in rows:
             key = name if raw else _short_name(name)
-            slot = per_agent[int(aid)][key]
-            slot[0] += int(n)
-            slot[1] += float(total or 0.0)
+            per_agent[int(aid)][key].append(float(dur or 0.0))
 
         busiest = max(
-            per_agent, key=lambda a: sum(v[1] for v in per_agent[a].values())
+            per_agent,
+            key=lambda a: sum(sum(v) for v in per_agent[a].values()),
         )
-        return dict(per_agent[busiest])
+        out = {}
+        busy = 0.0
+        for name, durs in per_agent[busiest].items():
+            out[name] = (len(durs), sum(durs), _median(durs), max(durs))
+            busy += sum(durs)
+        return out, busy
     finally:
         con.close()
 
 
-def compare(in_csv: str, base: str, other: str):
+def compare(in_csv: str, base: str, other: str, spin_re: str):
     """Print base-vs-other per-kernel time, per cell, from the appended CSV.
 
     SPX and CPX cannot be profiled in the same boot of the compute partition,
     so the two runs land in this CSV separately and are joined here. A kernel
     present in one mode only (the merge and the barrier exist only under CPX)
     shows a blank on the missing side rather than a fabricated zero-delta.
+
+    Leads with median us/dispatch, which maps onto the harness's us/step and is
+    immune to a single out-of-loop outlier. Spin/collective kernels are listed
+    but excluded from the totals line, and marked with a ``*`` -- see the module
+    docstring for why folding a peer-wait into a work comparison misleads.
     """
     import csv as _csv
 
-    # (S, B) -> kernel -> label -> max_ms
-    cells: dict[tuple[int, int], dict[str, dict[str, float]]] = defaultdict(
+    spin = re.compile(spin_re, re.I) if spin_re else None
+
+    # (S, B) -> kernel -> label -> (med_ns, total_ns)
+    cells: dict[tuple[int, int], dict[str, dict[str, tuple]]] = defaultdict(
         lambda: defaultdict(dict)
     )
     with open(in_csv) as f:
         for row in _csv.DictReader(f):
             key = (int(row["seq_len"]), int(row["batch"]))
-            cells[key][row["kernel"]][row["label"]] = float(row["max_ns"]) / 1e6
+            cells[key][row["kernel"]][row["label"]] = (
+                float(row["med_ns_per_dispatch"]),
+                float(row["total_max_ns"]),
+            )
 
     for (s, b), kernels in sorted(cells.items()):
+        def _is_spin(name):
+            return bool(spin and spin.search(name))
+
+        def _med(v, lbl):
+            return v[lbl][0] if lbl in v else None
+
         tot = {
-            lbl: sum(v.get(lbl, 0.0) for v in kernels.values())
+            lbl: sum(
+                (_med(v, lbl) or 0.0)
+                for n, v in kernels.items()
+                if not _is_spin(n)
+            )
             for lbl in (base, other)
         }
         print()
-        print(f"=== S={s} B={b} ===  {base}={tot[base]:.3f} ms  "
-              f"{other}={tot[other]:.3f} ms  "
-              f"delta={tot[other] - tot[base]:+.3f} ms")
-        print(f"{'kernel':<52} {base + '_ms':>10} {other + '_ms':>10} "
-              f"{'delta_ms':>10}")
-        print("-" * 86)
+        print(
+            f"=== S={s} B={b} ===  work-only us/step: "
+            f"{base}={tot[base] / 1e3:.1f}  {other}={tot[other] / 1e3:.1f}  "
+            f"delta={(tot[other] - tot[base]) / 1e3:+.1f}"
+        )
+        print(
+            f"{'kernel':<46} {base + '_us':>10} {other + '_us':>10} "
+            f"{'delta_us':>10} {base + '_ms':>9} {other + '_ms':>9}"
+        )
+        print("-" * 98)
+
         # Sort by the delta, largest regression first: the point of this view is
         # which kernel is responsible for the gap, not which is biggest.
         def _delta(item):
             v = item[1]
-            return -((v.get(other) or 0.0) - (v.get(base) or 0.0))
+            return -((_med(v, other) or 0.0) - (_med(v, base) or 0.0))
 
         for name, v in sorted(kernels.items(), key=_delta):
-            disp = name if len(name) <= 52 else name[:49] + "..."
-            a, o = v.get(base), v.get(other)
-            sa = f"{a:>10.3f}" if a is not None else f"{'-':>10}"
-            so = f"{o:>10.3f}" if o is not None else f"{'-':>10}"
-            d = (o or 0.0) - (a or 0.0)
-            print(f"{disp:<52} {sa} {so} {d:>+10.3f}")
+            mark = "*" if _is_spin(name) else " "
+            disp = name if len(name) <= 45 else name[:42] + "..."
+            a, o = _med(v, base), _med(v, other)
+            sa = f"{a / 1e3:>10.1f}" if a is not None else f"{'-':>10}"
+            so = f"{o / 1e3:>10.1f}" if o is not None else f"{'-':>10}"
+            d = ((o or 0.0) - (a or 0.0)) / 1e3
+            ta = v[base][1] / 1e6 if base in v else None
+            to = v[other][1] / 1e6 if other in v else None
+            sta = f"{ta:>9.3f}" if ta is not None else f"{'-':>9}"
+            sto = f"{to:>9.3f}" if to is not None else f"{'-':>9}"
+            print(f"{mark}{disp:<45} {sa} {so} {d:>+10.1f} {sta} {sto}")
+        if spin:
+            print("  * spin/collective: time is waiting on a peer, not work; "
+                  "excluded from the us/step totals above")
 
 
 def main():
@@ -235,6 +357,12 @@ def main():
         help="keep full mangled names incl. template args (shows NPAR_LOOPS)",
     )
     p.add_argument(
+        "--spin-regex",
+        default=_SPIN_DEFAULT,
+        help="kernels whose time is peer-wait, not work; reported separately. "
+             "Pass '' to disable.",
+    )
+    p.add_argument(
         "--top",
         type=int,
         default=15,
@@ -245,7 +373,7 @@ def main():
     if args.compare:
         if not args.in_csv:
             raise SystemExit("--compare needs --in-csv")
-        compare(args.in_csv, args.base_label, args.other_label)
+        compare(args.in_csv, args.base_label, args.other_label, args.spin_regex)
         return
     if not args.db_glob:
         raise SystemExit("--db-glob is required (or use --compare --in-csv)")
@@ -255,58 +383,87 @@ def main():
         print(f"[kern] ERROR: no db matched {args.db_glob}", file=sys.stderr)
         raise SystemExit(1)
 
-    # per kernel -> list of per-rank totals, and per-rank dispatch counts
     totals: dict[str, list[float]] = defaultdict(list)
+    meds: dict[str, list[float]] = defaultdict(list)
+    maxes: dict[str, list[float]] = defaultdict(list)
     counts: dict[str, list[int]] = defaultdict(list)
+    busies: list[float] = []
     n_ok = 0
     for db in dbs:
         try:
-            per_kernel = parse_db(db, args.raw)
+            per_kernel, busy = parse_db(db, args.raw)
         except Exception as e:  # noqa: BLE001
             print(f"[kern] WARN: {db}: {e}", file=sys.stderr)
             continue
         n_ok += 1
-        for name, (n, total) in per_kernel.items():
+        busies.append(busy)
+        for name, (n, total, med, mx) in per_kernel.items():
             totals[name].append(total)
+            meds[name].append(med)
+            maxes[name].append(mx)
             counts[name].append(n)
 
     if n_ok == 0:
         print(f"[kern] ERROR: nothing parsed from {len(dbs)} db(s)", file=sys.stderr)
         raise SystemExit(1)
 
-    # MAX across ranks: the XCDs are concurrent, so the slowest one sets the
-    # step time. Summing would present concurrent work as serial.
+    spin = re.compile(args.spin_regex, re.I) if args.spin_regex else None
+
+    # MAX across ranks per kernel: the XCDs are concurrent, so the slowest one
+    # sets the step time. Summing across ranks would present concurrent work as
+    # serial.
     rows = []
     for name, per_rank in totals.items():
-        mx = max(per_rank)
-        mean = sum(per_rank) / len(per_rank)
-        n = max(counts[name])
-        rows.append((name, len(per_rank), n, mx, mean, mx / n if n else 0.0))
+        rows.append(
+            (
+                name,
+                len(per_rank),
+                max(counts[name]),
+                max(per_rank),  # total, max across ranks
+                sum(per_rank) / len(per_rank),  # total, mean across ranks
+                max(meds[name]),  # median per dispatch, max across ranks
+                max(maxes[name]),  # slowest single dispatch anywhere
+                bool(spin and spin.search(name)),
+            )
+        )
     rows.sort(key=lambda r: -r[3])
 
-    step_ns = sum(r[3] for r in rows)
+    sum_of_maxes = sum(r[3] for r in rows)
+    work_ns = sum(r[3] for r in rows if not r[7])
+    spin_ns = sum_of_maxes - work_ns
     print(
-        f"[kern] label={args.label or '(none)'} S={args.seq_len} B={args.batch} "
-        f"dbs={n_ok}  GPU-time(max-across-ranks, all kernels)="
-        f"{step_ns / 1e6:.3f} ms"
+        f"[kern] label={args.label or '(none)'} S={args.seq_len} "
+        f"B={args.batch} dbs={n_ok}"
     )
     print(
-        f"{'kernel':<52} {'ranks':>5} {'disp':>6} "
-        f"{'max_ms':>10} {'mean_ms':>10} {'us/disp':>9} {'%':>6}"
+        f"  rank GPU-busy (all kernels, per-rank total): "
+        f"max {max(busies) / 1e6:.3f} ms   mean {sum(busies) / len(busies) / 1e6:.3f} ms"
     )
-    print("-" * 104)
+    print(
+        f"  sum of per-kernel maxes                    : "
+        f"{sum_of_maxes / 1e6:.3f} ms   "
+        f"(work {work_ns / 1e6:.3f} + spin/collective {spin_ns / 1e6:.3f})"
+    )
+    print(
+        f"{'kernel':<46} {'ranks':>5} {'disp':>5} {'tot_max_ms':>11} "
+        f"{'tot_mean_ms':>11} {'med_us':>9} {'max_us':>9}"
+    )
+    print("-" * 108)
     shown = rows if args.top <= 0 else rows[: args.top]
-    for name, nranks, n, mx, mean, per in shown:
-        disp = name if len(name) <= 52 else name[:49] + "..."
-        pct = 100.0 * mx / step_ns if step_ns else 0.0
+    for name, nranks, n, mx, mean, med, dmax, is_spin in shown:
+        disp = name if len(name) <= 45 else name[:42] + "..."
+        mark = "*" if is_spin else " "
         print(
-            f"{disp:<52} {nranks:>5} {n:>6} "
-            f"{mx / 1e6:>10.3f} {mean / 1e6:>10.3f} {per / 1e3:>9.2f} {pct:>6.1f}"
+            f"{mark}{disp:<45} {nranks:>5} {n:>5} {mx / 1e6:>11.3f} "
+            f"{mean / 1e6:>11.3f} {med / 1e3:>9.2f} {dmax / 1e3:>9.2f}"
         )
     if args.top > 0 and len(rows) > args.top:
         rest = sum(r[3] for r in rows[args.top:])
-        print(f"{'(' + str(len(rows) - args.top) + ' more)':<52} "
-              f"{'':>5} {'':>6} {rest / 1e6:>10.3f}")
+        print(f" {'(' + str(len(rows) - args.top) + ' more)':<45} "
+              f"{'':>5} {'':>5} {rest / 1e6:>11.3f}")
+    if spin:
+        print("  * spin/collective: duration is dominated by waiting on a peer "
+              "(and, for an out-of-loop collective, by rank skew), not by work")
 
     if args.out_csv:
         write_header = not os.path.exists(args.out_csv)
@@ -314,13 +471,14 @@ def main():
             if write_header:
                 f.write(
                     "label,seq_len,batch,kernel,n_ranks,n_dispatch,"
-                    "max_ns,mean_ns,ns_per_dispatch\n"
+                    "total_max_ns,total_mean_ns,med_ns_per_dispatch,"
+                    "max_ns_per_dispatch\n"
                 )
-            for name, nranks, n, mx, mean, per in rows:
+            for name, nranks, n, mx, mean, med, dmax, _ in rows:
                 safe = name.replace(",", ";")
                 f.write(
                     f"{args.label},{args.seq_len},{args.batch},{safe},"
-                    f"{nranks},{n},{mx:.0f},{mean:.0f},{per:.0f}\n"
+                    f"{nranks},{n},{mx:.0f},{mean:.0f},{med:.0f},{dmax:.0f}\n"
                 )
         print(f"[kern] appended {len(rows)} rows to {args.out_csv}")
 
