@@ -1436,7 +1436,15 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
                                            // max_num_partitions, head_size]
     const int* __restrict__ seq_lens,      // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
-    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr) {
+    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr,
+    // Starscream (CPX): optional [num_seqs, num_heads, HEAD_SIZE + 2] fp32
+    // partial-softmax record. When non-null the kernel emits
+    //   [0 : HEAD_SIZE]  un-normalized numerator, rescaled to this rank's max
+    //   [HEAD_SIZE]      L, the local exp_sum (also rescaled to that max)
+    //   [HEAD_SIZE + 1]  M, the local max logit
+    // and skips the final divide / fp8 conversion / `out` store -- the
+    // cross-rank merge finishes the softmax.
+    float* __restrict__ ss_meta_out) {
   const auto num_heads = gridDim.x;
   const auto head_idx = blockIdx.x;
   const auto seq_idx = blockIdx.y;
@@ -1451,6 +1459,45 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   const int seq_len = seq_lens[seq_idx];
   const int num_partitions = DIVIDE_ROUND_UP(seq_len, PARTITION_SIZE);
   const auto warpid = threadIdx.x / WARP_SIZE;
+
+  // NUM_THREADS == HEAD_SIZE for this kernel, so threadIdx.x indexes the head
+  // dimension of the record directly.
+  float* ss_meta_ptr =
+      (ss_meta_out != nullptr)
+          ? ss_meta_out +
+                (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
+                    (HEAD_SIZE + 2)
+          : nullptr;
+
+  // Finite stand-in for -inf: an all-empty merge then evaluates exp(M - M) = 1
+  // instead of exp(-inf + inf) = NaN.
+  constexpr float SS_NEG_HUGE = -3.0e38f;
+
+  // Under a context split a rank can own zero tokens for this sequence. Bail
+  // out before `last_valid_partition` goes negative and the loads below read
+  // out of bounds; emit an identity record so the merge ignores this rank.
+  if (num_partitions == 0) {
+    if (ss_meta_ptr != nullptr) {
+      ss_meta_ptr[threadIdx.x] = 0.0f;
+      if (threadIdx.x == 0) {
+        ss_meta_ptr[HEAD_SIZE] = 0.0f;
+        ss_meta_ptr[HEAD_SIZE + 1] = SS_NEG_HUGE;
+      }
+    } else {
+      const int64_t query_start_off = static_cast<int64_t>(
+          query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx);
+      OUTT* out_ptr = out + query_start_off * num_heads * HEAD_SIZE +
+                      static_cast<int64_t>(head_idx) * HEAD_SIZE;
+      if constexpr (std::is_same<OUTT, bit8_t>::value) {
+        out_ptr[threadIdx.x] = __hip_cvt_float_to_fp8(
+            0.0f, vllm::fp8::fp8_type::__default_saturation,
+            vllm::fp8::fp8_type::__default_interpret);
+      } else {
+        out_ptr[threadIdx.x] = from_float<scalar_t>(0.0f);
+      }
+    }
+    return;
+  }
 
   __shared__ float shared_global_exp_sum;
   // max num partitions supported is warp_size * NPAR_LOOPS
@@ -1521,6 +1568,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
     if (threadIdx.x == 0) {
       shared_global_exp_sum = global_exp_sum;
+      if (ss_meta_ptr != nullptr) {
+        // Both halves of the softmax state are live here; publish them before
+        // they go out of scope with the warp-0 block.
+        ss_meta_ptr[HEAD_SIZE] = global_exp_sum;
+        ss_meta_ptr[HEAD_SIZE + 1] = max_logit;
+      }
     }
   }  // warpid == 0
   const scalar_t* tmp_out_ptr =
@@ -1610,6 +1663,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     }
   }
 
+  if (ss_meta_ptr != nullptr) {
+    // Starscream: hand the un-normalized numerator to the cross-rank merge.
+    // The divide by L and any fp8 conversion happen after the merge.
+    ss_meta_ptr[threadIdx.x] = acc;
+    return;
+  }
   const float inv_global_exp_sum =
       __fdividef(1.0f, shared_global_exp_sum + 1e-6f);
   const float out_scale =
@@ -2203,7 +2262,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
                                            // max_num_partitions, head_size]
     const int* __restrict__ seq_lens,      // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
-    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr) {
+    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr,
+    float* __restrict__ ss_meta_out) {  // Starscream: unused on this arch
   const auto num_heads = gridDim.x;
   const auto head_idx = blockIdx.x;
   const auto seq_idx = blockIdx.y;
@@ -2936,7 +2996,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
                                            // max_num_partitions, head_size]
     const int* __restrict__ seq_lens,      // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
-    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr) {
+    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr,
+    float* __restrict__ ss_meta_out) {  // Starscream: unused on this arch
   const auto num_heads = gridDim.x;
   const auto head_idx = blockIdx.x;
   const auto seq_idx = blockIdx.y;
@@ -3189,7 +3250,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     const scalar_t* __restrict__ tmp_out,  // [num_seqs, num_heads, max_num_partitions, head_size]
     const int* __restrict__ seq_lens,  // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
-    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr) {
+    const int max_num_partitions, const float* __restrict__ fp8_out_scale_ptr,
+    float* __restrict__ ss_meta_out) {  // Starscream: unused on this arch
   UNREACHABLE_CODE
 }
 // clang-format on
@@ -3223,7 +3285,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
                                       PARTITION_SIZE, NPAR_LOOPS>           \
       <<<reduce_grid, reduce_block, 0, stream>>>(                           \
           out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, seq_lens_ptr, \
-          query_start_loc_ptr, max_num_partitions, fp8_out_scale_ptr);
+          query_start_loc_ptr, max_num_partitions, fp8_out_scale_ptr,      \
+          ss_meta_out_ptr);
 
 template <typename T, typename KVT, vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE, int HEAD_SIZE, typename OUTT, int PARTITION_SIZE_OLD,
@@ -3235,7 +3298,8 @@ void paged_attention_custom_launcher(
     torch::Tensor& block_tables, torch::Tensor& seq_lens,
     const std::optional<torch::Tensor>& query_start_loc, int max_seq_len,
     const std::optional<torch::Tensor>& alibi_slopes, torch::Tensor& k_scale,
-    torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale) {
+    torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
+    const std::optional<torch::Tensor>& starscream_meta_out) {
   int num_seqs = block_tables.size(0);
   int num_heads = query.size(1);
   int head_size = query.size(2);
@@ -3271,6 +3335,12 @@ void paged_attention_custom_launcher(
   const auto fp8_out_scale_ptr =
       fp8_out_scale
           ? static_cast<const float*>(fp8_out_scale.value().data_ptr())
+          : nullptr;
+  // NOTE: starscream_meta_out is optional. When present the reduce kernel
+  // emits per-rank partial softmax state instead of the final output.
+  float* ss_meta_out_ptr =
+      starscream_meta_out
+          ? reinterpret_cast<float*>(starscream_meta_out.value().data_ptr())
           : nullptr;
   OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
 
@@ -3423,6 +3493,8 @@ void paged_attention_custom_launcher_navi(
   const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
   // NOTE: Navi does not support fp8.
   const auto fp8_out_scale_ptr = nullptr;
+  // NOTE: Navi does not support the Starscream (CPX) path.
+  float* ss_meta_out_ptr = nullptr;
   OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
 
   const int max_ctx_blocks = DIVIDE_ROUND_UP(max_seq_len, BLOCK_SIZE);
@@ -3561,7 +3633,8 @@ void paged_attention_custom_launcher_navi(
                                     OUTT, PSIZE, ALIBI_ENABLED, MFMA_TYPE>( \
         out, exp_sums, max_logits, tmp_out, query, key_cache, value_cache,  \
         num_kv_heads, scale, block_tables, seq_lens, query_start_loc,       \
-        max_seq_len, alibi_slopes, k_scale, v_scale, fp8_out_scale);        \
+        max_seq_len, alibi_slopes, k_scale, v_scale, fp8_out_scale,         \
+        starscream_meta_out);                                               \
   } else {                                                                  \
     paged_attention_custom_launcher_navi<T, KVT, KV_DTYPE, BLK_SIZE,        \
                                          HEAD_SIZE, OUTT, PSIZE,            \
@@ -3665,10 +3738,31 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale,
     const std::optional<torch::Tensor>& fp8_out_scale,
-    const std::string& mfma_type) {
+    const std::string& mfma_type,
+    // Starscream (CPX): [num_seqs, num_heads, head_size + 2] fp32
+    const std::optional<torch::Tensor>& starscream_meta_out) {
   // clang-format on
   bool is_navi = is_navi_gpu();
   const int head_size = query.size(2);
+  if (starscream_meta_out) {
+    const auto& m = starscream_meta_out.value();
+    TORCH_CHECK(!is_navi, "Starscream (CPX) paged attention is not supported "
+                          "on Navi");
+    TORCH_CHECK(m.scalar_type() == at::ScalarType::Float,
+                "starscream_meta_out must be float32");
+    TORCH_CHECK(m.dim() == 3 && m.size(0) == query.size(0) &&
+                    m.size(1) == query.size(1) && m.size(2) == head_size + 2,
+                "starscream_meta_out must be [num_seqs, num_heads, "
+                "head_size + 2], got ",
+                m.sizes());
+    TORCH_CHECK(m.is_contiguous(), "starscream_meta_out must be contiguous");
+    // The reduce kernel returns before applying out_scale on the Starscream
+    // path -- quantizing per-rank partials would be wrong anyway. Fail loudly
+    // rather than silently dropping the scale.
+    TORCH_CHECK(!fp8_out_scale.has_value(),
+                "fp8_out_scale is not supported together with "
+                "starscream_meta_out; quantize after the cross-rank merge");
+  }
   if (kv_cache_dtype == "auto") {
     if (query.dtype() == at::ScalarType::Half) {
       CALL_CUSTOM_LAUNCHER_BLK_HEAD(
