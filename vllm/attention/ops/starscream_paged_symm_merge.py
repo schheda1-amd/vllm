@@ -30,6 +30,26 @@ writes its record straight into symmetric memory. At batch 1024 / 128 heads /
 head_size 128 the record is 68 MiB per rank, so that is 136 MiB of copy traffic
 removed from every decode step.
 
+Head-sharded aggregation
+------------------------
+Every rank holds a partial record for *all* ``num_heads`` heads -- that is
+forced by the input side, since a rank owns a non-overlapping KV slice and must
+attend every query head against it. But the *combine* for head ``h`` is a fixed
+piece of arithmetic over the 8 records for that head, and only one rank needs to
+run it.
+
+With ``SCATTER_HEADS=True`` the grid is ``(num_seqs, num_heads // CPX)`` and rank
+``r`` merges only heads ``[r*chunk, (r+1)*chunk)``, writing them at local indices
+``[0, chunk)``. The physical device still ends up owning all ``num_heads``
+outputs, exactly once -- which is what SPX produces, and what a TP-sharded
+``o_proj`` consumes. It is the inverse of the query all-gather, and it is free:
+a grid bound, not a second collective.
+
+With ``SCATTER_HEADS=False`` every rank merges every head, so the device
+produces ``CPX`` identical copies and pulls ``CPX`` times the peer traffic for
+the same answer. That mode exists so a rank's output can be diffed against a
+single-rank full-context reference; it is not the shape you want to benchmark.
+
 Record layout (must match ``ss_meta_out`` in csrc/rocm/attention.cu)
 --------------------------------------------------------------------
 Per (seq, head), ``HEAD_SIZE + 2`` contiguous fp32 slots::
@@ -62,10 +82,24 @@ def _fused_paged_merge_kernel(
     DEXT: tl.constexpr,  # HEAD_SIZE + 2
     BLOCK_D: tl.constexpr,  # next_pow2(HEAD_SIZE)
     CPX: tl.constexpr,  # number of XCDs == group world size
-    SCATTER_HEADS: tl.constexpr,  # write only this rank's head shard
+    SCATTER_HEADS: tl.constexpr,  # merge only this rank's head shard
 ):
     seq_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
+
+    if SCATTER_HEADS:
+        # Grid dim 1 is num_heads // CPX, so program_id(1) is a LOCAL head
+        # index. Lift it to the global index the peer records are addressed by;
+        # the local index is where it lands in `out`. Because the grid itself is
+        # narrowed, the peer loads below are never issued for heads this rank
+        # does not own -- that is where the CPX-fold traffic saving comes from.
+        # Masking the store alone would not save a byte.
+        out_head = tl.program_id(1)
+        head_idx = starscream_rank * (num_heads // CPX) + out_head
+    else:
+        # POC/benchmark mode: every rank merges the full head range, so the
+        # result can be diffed against a full-context single-rank reference.
+        head_idx = tl.program_id(1)
+        out_head = head_idx
 
     d = tl.arange(0, BLOCK_D)
     dim_mask = d < HEAD_SIZE
@@ -103,24 +137,10 @@ def _fused_paged_merge_kernel(
     # yields 0 either way, and dropping the epsilon removes a ~1e-6/L bias.
     acc = tl.where(overall_expsum == 0.0, 0.0, acc / overall_expsum)
 
-    if SCATTER_HEADS:
-        # Inverse of the query all-gather: this rank keeps heads
-        # [rank*chunk, (rank+1)*chunk) and writes them at local indices, which
-        # restores the head-sharded layout o_proj expects. Free -- it is a
-        # store mask, not a second collective.
-        chunk = num_heads // CPX
-        start = starscream_rank * chunk
-        in_rank = (head_idx >= start) & (head_idx < start + chunk)
-        out_head = head_idx - start
-        store_mask = dim_mask & in_rank
-    else:
-        # POC/benchmark mode: every rank writes the full head range, so the
-        # result can be diffed against a full-context single-rank reference.
-        out_head = head_idx
-        store_mask = dim_mask
-
+    # Every program stores unconditionally under both modes: the head shard is
+    # selected by the grid bound above, not by a predicate here.
     off = seq_idx.to(tl.int64) * out_stride_0 + out_head * out_stride_1 + d
-    tl.store(out_ptr + off, acc.to(out_ptr.dtype.element_ty), mask=store_mask)
+    tl.store(out_ptr + off, acc.to(out_ptr.dtype.element_ty), mask=dim_mask)
 
 
 def get_symm_meta(
@@ -174,6 +194,18 @@ def fused_paged_merge(
     was passed to ``paged_attention_rocm`` as ``starscream_meta_out``, so the
     HIP reduce kernel has already published this rank's record in place.
 
+    ``num_heads`` is always the GLOBAL head count -- it addresses the peer
+    records, whose layout does not change with the output sharding.
+
+    ``scatter_heads`` selects the output ownership:
+
+    * ``True``  -- this rank merges heads ``[rank*chunk, (rank+1)*chunk)`` and
+      ``out`` must be ``[num_seqs, num_heads // world, head_size]``. Each head
+      is merged once across the device, matching what SPX produces and what a
+      TP-sharded ``o_proj`` consumes. Peer traffic is ``world``x lower.
+    * ``False`` -- every rank merges every head and ``out`` must be full width.
+      Diffable against a single-rank reference; ``world``x redundant.
+
     Uses the on-device signal-pad barrier unconditionally rather than
     ``starscream_symm_reduce._barrier``. That helper honours
     ``VLLM_STARSCREAM_SIGNAL_PAD_BARRIER``, which defaults to False and would
@@ -195,10 +227,28 @@ def fused_paged_merge(
 
     cpx = buf.world_size
 
+    if scatter_heads:
+        if num_heads % cpx != 0:
+            raise ValueError(
+                f"scatter_heads needs num_heads ({num_heads}) divisible by the "
+                f"CPX world size ({cpx}); pad or fall back to scatter_heads=False"
+            )
+        heads_out = num_heads // cpx
+    else:
+        heads_out = num_heads
+    if out.shape[:2] != (num_seqs, heads_out):
+        raise ValueError(
+            f"out has shape {tuple(out.shape)}; expected "
+            f"({num_seqs}, {heads_out}, {head_size}) for "
+            f"scatter_heads={scatter_heads}"
+        )
+
     # Barrier 1: every peer's record is visible before anyone reads it.
     barrier()
 
-    _fused_paged_merge_kernel[(num_seqs, num_heads)](
+    # Grid dim 1 is the number of heads THIS rank merges. Narrowing it is the
+    # whole optimisation: an unlaunched program issues no peer loads.
+    _fused_paged_merge_kernel[(num_seqs, heads_out)](
         out_ptr=out,
         peer_ptrs=buf.peer_ptrs,
         starscream_rank=buf.rank_in_group,

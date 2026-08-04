@@ -146,6 +146,7 @@ def benchmark_config(
     check: bool = False,
     num_blocks: int = DEFAULT_NUM_BLOCKS,
     merge: str = "fused",
+    scatter_heads: bool = False,
     group=None,
 ) -> dict:
     # Same seed on every rank: the query and the global block table must match,
@@ -197,7 +198,28 @@ def benchmark_config(
     )
     key_cache, value_cache = key_caches[0], value_caches[0]
 
+    # `out` argument of paged_attention_rocm. Full width on purpose: the
+    # binding derives num_heads from its shape. On the Starscream path the HIP
+    # reduce kernel early-returns into starscream_meta_out and never writes it,
+    # so it is pure scratch -- the kind of temporary redundancy that costs
+    # nothing because no traffic touches it.
     output = torch.empty_like(query)
+
+    # The tensor this rank actually OWNS. Under head-sharded aggregation that
+    # is num_query_heads // world heads at local indices [0, chunk); across the
+    # 8 XCDs the physical device holds all num_query_heads exactly once, which
+    # is what SPX produces.
+    # When not sharding it aliases `output` -- same shape, same dtype, and the
+    # HIP kernel never writes it -- so the replicated path allocates exactly
+    # what it used to (32 MiB matters on an XCD that owns ~24 GiB).
+    heads_out = num_query_heads // world if scatter_heads else num_query_heads
+    head_offset = rank * heads_out if scatter_heads else 0
+    merged = (
+        torch.empty((num_seqs, heads_out, head_size), dtype=dtype, device=device)
+        if scatter_heads
+        else output
+    )
+
     num_partitions = (max_local_len + PARTITION_SIZE_ROCM - 1) // PARTITION_SIZE_ROCM
     tmp_output = torch.empty(
         (num_seqs, num_query_heads, num_partitions, head_size),
@@ -269,25 +291,26 @@ def benchmark_config(
         def run_step():
             run_local(meta)
             fused_paged_merge(
-                output,
+                merged,
                 symm_buf,
                 group,
                 num_seqs,
-                num_query_heads,
+                num_query_heads,  # global: addresses the peer records
                 head_size,
-                scatter_heads=False,
+                scatter_heads=scatter_heads,
             )
 
     else:
 
         def run_step():
             run_local(meta)
-            starscream_merge(meta, output, world, gathered=gathered)
+            starscream_merge(meta, merged, world, gathered=gathered)
 
     if check:
         return _correctness_check(
             run_step,
-            output,
+            merged,
+            head_offset,
             query,
             key_cache,
             value_cache,
@@ -343,7 +366,8 @@ def benchmark_config(
 
 def _correctness_check(
     run_step,
-    output,
+    merged,
+    head_offset,
     query,
     key_cache,
     value_cache,
@@ -363,11 +387,13 @@ def _correctness_check(
     """Compare the merged CPX result against a full-context single-rank run.
 
     Every rank computes the same full-context reference (all ranks hold
-    identical KV caches, since they share a seed), so the verdict is identical
-    everywhere and needs no collective.
+    identical KV caches, since they share a seed). Under head-sharded
+    aggregation each rank then checks a DIFFERENT slice of it, so the verdicts
+    are no longer identical by construction and main() must all-reduce them
+    before anyone is allowed to exit.
     """
     run_step()
-    got = output.clone()
+    got = merged.clone()
 
     ref = torch.empty_like(query)
     npar = (seq_len + PARTITION_SIZE_ROCM - 1) // PARTITION_SIZE_ROCM
@@ -401,6 +427,12 @@ def _correctness_check(
         v_scale,
     )
     torch.cuda.synchronize()
+
+    # Line up the reference with what this rank owns. Under head-sharded
+    # aggregation `got` is [B, num_heads // world, D] holding global heads
+    # [head_offset, head_offset + chunk) at local indices; otherwise it is the
+    # full tensor and this slice is a no-op.
+    ref = ref[:, head_offset : head_offset + got.shape[1]]
 
     # Tolerance-based: the producer and the reducer each carry their own 1e-6
     # epsilon and the reduction order differs, so bit-exactness is impossible.
@@ -456,6 +488,17 @@ def main():
              "symm-mem). rccl: all_gather_into_tensor + separate merge kernel.",
     )
     parser.add_argument(
+        "--scatter-heads",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="head-sharded aggregation: rank r merges only heads "
+             "[r*chunk, (r+1)*chunk), so each head is combined ONCE across the "
+             "device -- the same output ownership SPX has, and what a "
+             "TP-sharded o_proj consumes. Cuts cross-XCD merge traffic by the "
+             "world size. --no-scatter-heads reverts to every rank merging "
+             "every head (world x redundant); fused merge only.",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="validate the merged output against a full-context single-rank run",
@@ -505,6 +548,28 @@ def main():
                     flush=True,
                 )
 
+    # Head sharding lives in the fused merge kernel's grid. The RCCL path does
+    # not get it: its redundancy is in all_gather_into_tensor, which hands every
+    # rank all world records regardless of which heads it needs, so narrowing
+    # the kernel there would save arithmetic but not one byte of link traffic.
+    # Reshaping that collective is a separate change; don't imply it happened.
+    scatter_heads = args.scatter_heads and merge_mode == "fused" and world > 1
+    if scatter_heads and args.num_query_heads % world != 0:
+        scatter_heads = False
+        if rank == 0:
+            print(
+                f"  WARNING: num_query_heads={args.num_query_heads} is not "
+                f"divisible by world={world} -- head sharding disabled.",
+                flush=True,
+            )
+    elif args.scatter_heads and not scatter_heads and world > 1:
+        if rank == 0:
+            print(
+                "  WARNING: --scatter-heads applies to the fused merge only "
+                "-- ignored on the RCCL path.",
+                flush=True,
+            )
+
     common = dict(
         num_query_heads=args.num_query_heads,
         num_kv_heads=args.num_kv_heads,
@@ -517,6 +582,7 @@ def main():
         kv_cache_dtype=args.kv_cache_dtype,
         num_blocks=args.num_blocks,
         merge=merge_mode,
+        scatter_heads=scatter_heads,
         group=group,
     )
 
@@ -537,6 +603,18 @@ def main():
                 check=True,
                 **common,
             )
+            # Under head sharding each rank checked a different head slice, so
+            # rank 0's verdict is no longer the whole story -- and a rank
+            # exiting alone on its own FAIL would strand the rest at the
+            # barrier below. Reduce to the worst error seen anywhere.
+            worst = torch.tensor(
+                [c["max_abs"], c["max_rel"], 0.0 if c["ok"] else 1.0],
+                dtype=torch.float64,
+                device=f"cuda:{local_rank}",
+            )
+            dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+            c["max_abs"], c["max_rel"] = worst[0].item(), worst[1].item()
+            c["ok"] = worst[2].item() == 0.0
             all_ok = all_ok and c["ok"]
             if rank == 0:
                 print(
@@ -564,7 +642,7 @@ def main():
         print(f"  head_size={args.head_size}, block_size={args.block_size}")
         print(f"  dtype={args.dtype}, kv_cache_dtype={args.kv_cache_dtype}")
         print(f"  num_iters={args.num_iters}, num_blocks={args.num_blocks}/rank")
-        print(f"  merge={merge_mode}")
+        print(f"  merge={merge_mode}, scatter_heads={scatter_heads}")
         print()
         print(f"{'SeqLen':>10} {'BatchSize':>10} {'Latency(us)':>12} {'BW(GB/s)':>10}")
         print("-" * 50)
