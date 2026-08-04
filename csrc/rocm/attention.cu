@@ -1424,7 +1424,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 
 // Grid: (num_heads, num_seqs).
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -1579,73 +1579,66 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   const scalar_t* tmp_out_ptr =
       tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
       head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
-  constexpr int MAX_NPAR = 64;
+  // Partition slots this instantiation carries in registers.
+  //
+  // TMP_CHUNK == 0 means "a full warp's worth", which is the only width the
+  // multi-pass NPAR_LOOPS > 1 path below can use -- it strides both `tmps` and
+  // `shared_exp_sums` by exactly that. The host passes a smaller power of two
+  // when the whole context fits in fewer partitions than a warp, and that is
+  // the entire point of the parameter: what used to be a mandatory 16/32/64
+  // staircase (JCHUNK tiers, each entered by a runtime branch, each CLAMPING
+  // past the real partition count rather than skipping) becomes one unrolled
+  // loop of exactly next_pow2(max_num_partitions) iterations.
+  //
+  // The old floor cost real time whenever a rank owned few partitions. Under a
+  // CPX/Starscream context split at 8K global context a rank owns 1024 tokens
+  // = 4 partitions; the floor of 16 issued 4x the loads it needed and held
+  // tmps[64] -- 32 VGPRs of bf16 -- to carry 4 useful values. Measured at
+  // 4.2x the SPX reduce time on the same (num_heads, num_seqs) grid with 1/8
+  // the CUs, which is what the load ratio predicts. Long contexts were never
+  // affected: their partition count already reached the top tier, so nothing
+  // about the SPX path changes here.
+  //
+  // Sizing is per LAUNCH, not per sequence -- `tmps` is a register array. A
+  // ragged batch still sizes to its longest sequence and shorter ones clamp as
+  // they always did. max_num_partitions bounds every sequence's num_partitions
+  // (both derive from max_seq_len), which is what makes that clamp safe.
+  static_assert(NPAR_LOOPS == 1 || TMP_CHUNK == 0,
+                "NPAR_LOOPS > 1 walks tmps and shared_exp_sums in warp-sized "
+                "strides, so shrinking TMP_CHUNK is only valid when the whole "
+                "context is covered in a single pass");
+  constexpr int MAX_NPAR =
+      (TMP_CHUNK == 0 || TMP_CHUNK > WARP_SIZE) ? WARP_SIZE : TMP_CHUNK;
+
   scalar_t tmps[MAX_NPAR];
-  const float dzero = 0.0f;
-  #pragma unroll
-  for (int j = 0; j < MAX_NPAR; j++) {
-    tmps[j] = from_float<scalar_t>(dzero);
-  }
   const int last_partition_offset = (num_partitions - 1) * HEAD_SIZE;
   const int num_partition_offset = (num_partitions)*HEAD_SIZE;
-  int idx = 0;
 
-  constexpr int JCHUNK = 16;
-
+  // No zero-init: every slot is written below before it is read. The old code
+  // needed one because a skipped staircase tier left its slots untouched while
+  // the matching accumulate tier was skipped too.
   #pragma unroll
-  for (int j = 0; j < JCHUNK * HEAD_SIZE; j += HEAD_SIZE) {
-    // lastj is last valid partition
+  for (int j = 0; j < MAX_NPAR; j++) {
+    // Clamp rather than skip past the last real partition, as before. The
+    // duplicate load is harmless: warp 0 zeroed shared_exp_sums for every
+    // partition_no >= num_partitions, so it contributes nothing to acc.
+    const int off = j * HEAD_SIZE;
     const int lastj_offset =
-        (j < num_partition_offset) ? j : last_partition_offset;
-    tmps[idx] = tmp_out_ptr[lastj_offset];
-    idx++;
+        (off < num_partition_offset) ? off : last_partition_offset;
+    tmps[j] = tmp_out_ptr[lastj_offset];
   }
   __syncthreads();
-
-  if (num_partitions > JCHUNK) {
-  #pragma unroll
-    for (int j = JCHUNK * HEAD_SIZE; j < 2 * JCHUNK * HEAD_SIZE;
-         j += HEAD_SIZE) {
-      const int lastj_offset =
-          (j < num_partition_offset) ? j : last_partition_offset;
-      tmps[idx] = tmp_out_ptr[lastj_offset];
-      idx++;
-    }
-
-    if (num_partitions > 2 * JCHUNK) {
-  #pragma unroll
-      for (int j = 2 * JCHUNK * HEAD_SIZE; j < MAX_NPAR * HEAD_SIZE;
-           j += HEAD_SIZE) {
-        const int lastj_offset =
-            (j < num_partition_offset) ? j : last_partition_offset;
-        tmps[idx] = tmp_out_ptr[lastj_offset];
-        idx++;
-      }
-    }
-  }  // num_partitions > JCHUNK
 
   // Aggregate tmp_out to out.
   float acc = 0.0f;
   #pragma unroll
-  for (int j = 0; j < JCHUNK; j++) {
+  for (int j = 0; j < MAX_NPAR; j++) {
     acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-  }
-  if (num_partitions > JCHUNK) {
-  #pragma unroll
-    for (int j = JCHUNK; j < 2 * JCHUNK; j++) {
-      acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-    }
-    if (num_partitions > 2 * JCHUNK) {
-  #pragma unroll
-      for (int j = 2 * JCHUNK; j < MAX_NPAR; j++) {
-        acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-      }
-    }
   }
 
   for (int p = 1; p < NPAR_LOOPS; p++) {
     if (num_partitions > p * MAX_NPAR) {
-      idx = 0;
+      int idx = 0;
   #pragma unroll
       for (int j = p * MAX_NPAR * HEAD_SIZE; j < (p + 1) * MAX_NPAR * HEAD_SIZE;
            j += HEAD_SIZE) {
@@ -2250,7 +2243,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 
 // Grid: (num_heads, num_seqs).
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -2353,73 +2346,43 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   const scalar_t* tmp_out_ptr =
       tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
       head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
-  constexpr int MAX_NPAR = 32;
+  // Same TMP_CHUNK transform as the gfx9 copy above -- see there for the
+  // rationale. MAX_NPAR derives from WARP_SIZE rather than the literal 32 it
+  // used to be, so this arch keeps its warp-width behaviour unchanged when the
+  // host passes TMP_CHUNK == 0.
+  static_assert(NPAR_LOOPS == 1 || TMP_CHUNK == 0,
+                "NPAR_LOOPS > 1 walks tmps and shared_exp_sums in warp-sized "
+                "strides, so shrinking TMP_CHUNK is only valid when the whole "
+                "context is covered in a single pass");
+  constexpr int MAX_NPAR =
+      (TMP_CHUNK == 0 || TMP_CHUNK > WARP_SIZE) ? WARP_SIZE : TMP_CHUNK;
+
   scalar_t tmps[MAX_NPAR];
-  const float dzero = 0.0f;
-  #pragma unroll
-  for (int j = 0; j < MAX_NPAR; j++) {
-    tmps[j] = from_float<scalar_t>(dzero);
-  }
   const int last_partition_offset = (num_partitions - 1) * HEAD_SIZE;
   const int num_partition_offset = (num_partitions)*HEAD_SIZE;
-  int idx = 0;
 
-  constexpr int JCHUNK = 16;
-
+  // No zero-init: every slot is written below before it is read.
   #pragma unroll
-  for (int j = 0; j < JCHUNK * HEAD_SIZE; j += HEAD_SIZE) {
-    // lastj is last valid partition
+  for (int j = 0; j < MAX_NPAR; j++) {
+    // Clamp rather than skip past the last real partition, as before; warp 0
+    // zeroed shared_exp_sums there, so the duplicate contributes nothing.
+    const int off = j * HEAD_SIZE;
     const int lastj_offset =
-        (j < num_partition_offset) ? j : last_partition_offset;
-    tmps[idx] = tmp_out_ptr[lastj_offset];
-    idx++;
+        (off < num_partition_offset) ? off : last_partition_offset;
+    tmps[j] = tmp_out_ptr[lastj_offset];
   }
   __syncthreads();
-
-  if (num_partitions > JCHUNK) {
-  #pragma unroll
-    for (int j = JCHUNK * HEAD_SIZE; j < 2 * JCHUNK * HEAD_SIZE;
-         j += HEAD_SIZE) {
-      const int lastj_offset =
-          (j < num_partition_offset) ? j : last_partition_offset;
-      tmps[idx] = tmp_out_ptr[lastj_offset];
-      idx++;
-    }
-
-    if (num_partitions > 2 * JCHUNK) {
-  #pragma unroll
-      for (int j = 2 * JCHUNK * HEAD_SIZE; j < MAX_NPAR * HEAD_SIZE;
-           j += HEAD_SIZE) {
-        const int lastj_offset =
-            (j < num_partition_offset) ? j : last_partition_offset;
-        tmps[idx] = tmp_out_ptr[lastj_offset];
-        idx++;
-      }
-    }
-  }  // num_partitions > JCHUNK
 
   // Aggregate tmp_out to out.
   float acc = 0.0f;
   #pragma unroll
-  for (int j = 0; j < JCHUNK; j++) {
+  for (int j = 0; j < MAX_NPAR; j++) {
     acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-  }
-  if (num_partitions > JCHUNK) {
-  #pragma unroll
-    for (int j = JCHUNK; j < 2 * JCHUNK; j++) {
-      acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-    }
-    if (num_partitions > 2 * JCHUNK) {
-  #pragma unroll
-      for (int j = 2 * JCHUNK; j < MAX_NPAR; j++) {
-        acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-      }
-    }
   }
 
   for (int p = 1; p < NPAR_LOOPS; p++) {
     if (num_partitions > p * MAX_NPAR) {
-      idx = 0;
+      int idx = 0;
   #pragma unroll
       for (int j = p * MAX_NPAR * HEAD_SIZE; j < (p + 1) * MAX_NPAR * HEAD_SIZE;
            j += HEAD_SIZE) {
@@ -2984,7 +2947,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 
 // Grid: (num_heads, num_seqs).
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -3087,73 +3050,43 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   const scalar_t* tmp_out_ptr =
       tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
       head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
-  constexpr int MAX_NPAR = 32;
+  // Same TMP_CHUNK transform as the gfx9 copy above -- see there for the
+  // rationale. MAX_NPAR derives from WARP_SIZE rather than the literal 32 it
+  // used to be, so this arch keeps its warp-width behaviour unchanged when the
+  // host passes TMP_CHUNK == 0.
+  static_assert(NPAR_LOOPS == 1 || TMP_CHUNK == 0,
+                "NPAR_LOOPS > 1 walks tmps and shared_exp_sums in warp-sized "
+                "strides, so shrinking TMP_CHUNK is only valid when the whole "
+                "context is covered in a single pass");
+  constexpr int MAX_NPAR =
+      (TMP_CHUNK == 0 || TMP_CHUNK > WARP_SIZE) ? WARP_SIZE : TMP_CHUNK;
+
   scalar_t tmps[MAX_NPAR];
-  const float dzero = 0.0f;
-  #pragma unroll
-  for (int j = 0; j < MAX_NPAR; j++) {
-    tmps[j] = from_float<scalar_t>(dzero);
-  }
   const int last_partition_offset = (num_partitions - 1) * HEAD_SIZE;
   const int num_partition_offset = (num_partitions)*HEAD_SIZE;
-  int idx = 0;
 
-  constexpr int JCHUNK = 16;
-
+  // No zero-init: every slot is written below before it is read.
   #pragma unroll
-  for (int j = 0; j < JCHUNK * HEAD_SIZE; j += HEAD_SIZE) {
-    // lastj is last valid partition
+  for (int j = 0; j < MAX_NPAR; j++) {
+    // Clamp rather than skip past the last real partition, as before; warp 0
+    // zeroed shared_exp_sums there, so the duplicate contributes nothing.
+    const int off = j * HEAD_SIZE;
     const int lastj_offset =
-        (j < num_partition_offset) ? j : last_partition_offset;
-    tmps[idx] = tmp_out_ptr[lastj_offset];
-    idx++;
+        (off < num_partition_offset) ? off : last_partition_offset;
+    tmps[j] = tmp_out_ptr[lastj_offset];
   }
   __syncthreads();
-
-  if (num_partitions > JCHUNK) {
-  #pragma unroll
-    for (int j = JCHUNK * HEAD_SIZE; j < 2 * JCHUNK * HEAD_SIZE;
-         j += HEAD_SIZE) {
-      const int lastj_offset =
-          (j < num_partition_offset) ? j : last_partition_offset;
-      tmps[idx] = tmp_out_ptr[lastj_offset];
-      idx++;
-    }
-
-    if (num_partitions > 2 * JCHUNK) {
-  #pragma unroll
-      for (int j = 2 * JCHUNK * HEAD_SIZE; j < MAX_NPAR * HEAD_SIZE;
-           j += HEAD_SIZE) {
-        const int lastj_offset =
-            (j < num_partition_offset) ? j : last_partition_offset;
-        tmps[idx] = tmp_out_ptr[lastj_offset];
-        idx++;
-      }
-    }
-  }  // num_partitions > JCHUNK
 
   // Aggregate tmp_out to out.
   float acc = 0.0f;
   #pragma unroll
-  for (int j = 0; j < JCHUNK; j++) {
+  for (int j = 0; j < MAX_NPAR; j++) {
     acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-  }
-  if (num_partitions > JCHUNK) {
-  #pragma unroll
-    for (int j = JCHUNK; j < 2 * JCHUNK; j++) {
-      acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-    }
-    if (num_partitions > 2 * JCHUNK) {
-  #pragma unroll
-      for (int j = 2 * JCHUNK; j < MAX_NPAR; j++) {
-        acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-      }
-    }
   }
 
   for (int p = 1; p < NPAR_LOOPS; p++) {
     if (num_partitions > p * MAX_NPAR) {
-      idx = 0;
+      int idx = 0;
   #pragma unroll
       for (int j = p * MAX_NPAR * HEAD_SIZE; j < (p + 1) * MAX_NPAR * HEAD_SIZE;
            j += HEAD_SIZE) {
@@ -3241,7 +3174,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 
 // Grid: (num_heads, num_seqs).
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -3280,9 +3213,13 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
           kv_head_stride, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, out_ptr,  \
           max_ctx_blocks, k_scale_ptr, v_scale_ptr);
 
-#define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS)                                 \
+// TMP_CHUNK sizes the reduce kernel's per-thread partition register array;
+// 0 means a full warp's worth, which is the pre-existing behaviour and the
+// only value valid when NPAR_LOOPS > 1. See the kernel body for why.
+#define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS, TMP_CHUNK)                      \
   paged_attention_ll4mi_reduce_kernel<T, OUTT, HEAD_SIZE, HEAD_SIZE,        \
-                                      PARTITION_SIZE, NPAR_LOOPS>           \
+                                      PARTITION_SIZE, NPAR_LOOPS,           \
+                                      TMP_CHUNK>                            \
       <<<reduce_grid, reduce_block, 0, stream>>>(                           \
           out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, seq_lens_ptr, \
           query_start_loc_ptr, max_num_partitions, fp8_out_scale_ptr,      \
@@ -3420,32 +3357,70 @@ void paged_attention_custom_launcher(
   const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
   // reduction kernel supports upto 8 NPAR_loops * 64 (warp_size) * 256
   // (partition size) = 128K context length
+  if (npar_loops == 1) {
+    // The whole context fits in one pass, so the kernel's register array can
+    // be sized to the partitions actually present instead of to a full warp.
+    // next_pow2 keeps this to a handful of instantiations while guaranteeing
+    // TMP_CHUNK >= max_num_partitions >= every sequence's num_partitions,
+    // which is the invariant the in-kernel clamp relies on.
+    //
+    // This is what a context-parallel split needs: at 8K context over 8 XCDs a
+    // rank owns 4 partitions, and the old fixed 16-partition floor made its
+    // reduce 4.2x the SPX one. SPX is unaffected -- 8K on one device is 32
+    // partitions, which selected 32 loads before and selects 32 now.
+    //
+    // Floor of 4 rather than 1: below that the kernel is already trivial and
+    // the clamped loads all resolve to the same cache line, so further rungs
+    // would buy compile time rather than performance.
+    int tmp_chunk = 4;
+    while (tmp_chunk < max_num_partitions) tmp_chunk *= 2;
+    switch (tmp_chunk) {
+      case 4:
+        LAUNCH_CUSTOM_REDUCTION(1, 4);
+        break;
+      case 8:
+        LAUNCH_CUSTOM_REDUCTION(1, 8);
+        break;
+      case 16:
+        LAUNCH_CUSTOM_REDUCTION(1, 16);
+        break;
+      case 32:
+        LAUNCH_CUSTOM_REDUCTION(1, 32);
+        break;
+      default:
+        // At or above warp width. Pass 0 rather than a literal: the host's
+        // WARP_SIZE is a runtime device query while the kernel's is a
+        // compile-time constant per arch, so 0 ("full warp") is the only way
+        // to say this that stays correct on both wave64 and wave32.
+        LAUNCH_CUSTOM_REDUCTION(1, 0);
+        break;
+    }
+    return;
+  }
   switch (npar_loops) {
-    case 1:
-      LAUNCH_CUSTOM_REDUCTION(1);
-      break;
     case 2:
-      LAUNCH_CUSTOM_REDUCTION(2);
+      LAUNCH_CUSTOM_REDUCTION(2, 0);
       break;
     case 3:
-      LAUNCH_CUSTOM_REDUCTION(3);
+      LAUNCH_CUSTOM_REDUCTION(3, 0);
       break;
     case 4:
-      LAUNCH_CUSTOM_REDUCTION(4);
+      LAUNCH_CUSTOM_REDUCTION(4, 0);
       break;
     case 5:
-      LAUNCH_CUSTOM_REDUCTION(5);
+      LAUNCH_CUSTOM_REDUCTION(5, 0);
       break;
     case 6:
-      LAUNCH_CUSTOM_REDUCTION(6);
+      LAUNCH_CUSTOM_REDUCTION(6, 0);
       break;
     case 7:
-      LAUNCH_CUSTOM_REDUCTION(7);
+      LAUNCH_CUSTOM_REDUCTION(7, 0);
       break;
     case 8:
-      LAUNCH_CUSTOM_REDUCTION(8);
+      LAUNCH_CUSTOM_REDUCTION(8, 0);
       break;
     default:
+      // npar_loops == 0 lands here too (max_seq_len == 0), as it did before.
       TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);
       break;
   }
@@ -3571,54 +3546,61 @@ void paged_attention_custom_launcher_navi(
   const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warp_size);
   // reduction kernel supports upto 16 NPAR_loops * 32 (warp_size) * 256
   // (partition size) = 128K context length
+  //
+  // TMP_CHUNK is 0 (full warp width) throughout: this launcher keeps exactly
+  // its previous behaviour. The shrink the other launcher does for
+  // npar_loops == 1 would apply here too -- it is the same kernel and the same
+  // arithmetic -- but it is an optimisation for a context-parallel split that
+  // this path does not run, and it is not measurable on the hardware in front
+  // of this change. Adopt it here only alongside a Navi measurement.
   switch (npar_loops) {
     case 1:
-      LAUNCH_CUSTOM_REDUCTION(1);
+      LAUNCH_CUSTOM_REDUCTION(1, 0);
       break;
     case 2:
-      LAUNCH_CUSTOM_REDUCTION(2);
+      LAUNCH_CUSTOM_REDUCTION(2, 0);
       break;
     case 3:
-      LAUNCH_CUSTOM_REDUCTION(3);
+      LAUNCH_CUSTOM_REDUCTION(3, 0);
       break;
     case 4:
-      LAUNCH_CUSTOM_REDUCTION(4);
+      LAUNCH_CUSTOM_REDUCTION(4, 0);
       break;
     case 5:
-      LAUNCH_CUSTOM_REDUCTION(5);
+      LAUNCH_CUSTOM_REDUCTION(5, 0);
       break;
     case 6:
-      LAUNCH_CUSTOM_REDUCTION(6);
+      LAUNCH_CUSTOM_REDUCTION(6, 0);
       break;
     case 7:
-      LAUNCH_CUSTOM_REDUCTION(7);
+      LAUNCH_CUSTOM_REDUCTION(7, 0);
       break;
     case 8:
-      LAUNCH_CUSTOM_REDUCTION(8);
+      LAUNCH_CUSTOM_REDUCTION(8, 0);
       break;
     case 9:
-      LAUNCH_CUSTOM_REDUCTION(9);
+      LAUNCH_CUSTOM_REDUCTION(9, 0);
       break;
     case 10:
-      LAUNCH_CUSTOM_REDUCTION(10);
+      LAUNCH_CUSTOM_REDUCTION(10, 0);
       break;
     case 11:
-      LAUNCH_CUSTOM_REDUCTION(11);
+      LAUNCH_CUSTOM_REDUCTION(11, 0);
       break;
     case 12:
-      LAUNCH_CUSTOM_REDUCTION(12);
+      LAUNCH_CUSTOM_REDUCTION(12, 0);
       break;
     case 13:
-      LAUNCH_CUSTOM_REDUCTION(13);
+      LAUNCH_CUSTOM_REDUCTION(13, 0);
       break;
     case 14:
-      LAUNCH_CUSTOM_REDUCTION(14);
+      LAUNCH_CUSTOM_REDUCTION(14, 0);
       break;
     case 15:
-      LAUNCH_CUSTOM_REDUCTION(15);
+      LAUNCH_CUSTOM_REDUCTION(15, 0);
       break;
     case 16:
-      LAUNCH_CUSTOM_REDUCTION(16);
+      LAUNCH_CUSTOM_REDUCTION(16, 0);
       break;
     default:
       TORCH_CHECK(false, "Unsupported npar_loops: ", npar_loops);
