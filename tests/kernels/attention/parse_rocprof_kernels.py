@@ -87,7 +87,37 @@ from collections import defaultdict
 # CPX instantiates NPAR_LOOPS=1, so with the args kept the same kernel lands on
 # two different rows of the compare table and reads as "SPX-only" and
 # "CPX-only" instead of as the one row whose delta is the whole question.
-_TEMPLATE_ARGS = re.compile(r"<.*>", re.DOTALL)
+
+
+def _strip_template_args(n: str) -> str:
+    """Remove the outermost ``<...>`` span, tracking nesting.
+
+    Not a regex, and not done after splitting off the parameter list, because
+    the QKV kernel's KV_DTYPE is a non-type parameter that formats as
+    ``(vllm::Fp8KVCacheDataType)0`` -- a parenthesis INSIDE the template list:
+
+        void paged_attention_ll4mi_QKV_mfma16_kernel<__hip_bfloat16,
+            __hip_bfloat16, (vllm::Fp8KVCacheDataType)0, ...>(...)
+
+    Splitting on ``(`` first truncates there, leaving an unbalanced ``<`` that
+    no ``<.*>`` can match, so the args survive into the row name. The reduce
+    kernel has no such parameter and shortened correctly, which is why the two
+    rows of the same trace disagreed on format.
+
+    Left as-is under --raw, where the args are the point.
+    """
+    i = n.find("<")
+    if i < 0:
+        return n
+    depth = 0
+    for j in range(i, len(n)):
+        if n[j] == "<":
+            depth += 1
+        elif n[j] == ">":
+            depth -= 1
+            if depth == 0:
+                return n[:i] + n[j + 1 :]
+    return n[:i]  # unterminated (truncated symbol): drop the tail
 
 # Leading <length><identifier> component of an Itanium mangled name.
 _MANGLED_PART = re.compile(r"(\d+)")
@@ -100,7 +130,7 @@ _IDENT = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
 # this file is APPENDED to across runs that may be days and a parser revision
 # apart. Both ends therefore check the header rather than trusting it.
 CSV_HEADER = (
-    "label,seq_len,batch,kernel,n_ranks,n_steps,n_disp_win,n_disp_all,"
+    "label,seq_len,batch,kernel_short,n_ranks,n_steps,n_disp_win,n_disp_all,"
     "per_step_ns,total_max_ns,total_mean_ns,med_ns_per_dispatch,"
     "max_ns_per_dispatch,min_ns_per_dispatch"
 )
@@ -124,6 +154,16 @@ _LEGACY_HEADERS = {
     "label,seq_len,batch,kernel,n_ranks,n_steps,n_disp_win,n_disp_all,"
     "per_step_ns,total_max_ns,total_mean_ns,med_ns_per_dispatch,"
     "max_ns_per_dispatch",
+    # Same COLUMNS as current, so this rename is the only thing that can force a
+    # re-parse. Its rows carry the pre-fix kernel names, where the QKV row kept
+    # a truncated template list ("...QKV_mfma16_kernel<__hip_bfloat16;") because
+    # _short_name split on '(' before stripping <>. Those names no longer match
+    # the ones this parser emits, so mixing the two makes every kernel appear
+    # twice in --compare -- once per label, each blank on the other side, which
+    # reads exactly like "this kernel exists in only one mode".
+    "label,seq_len,batch,kernel,n_ranks,n_steps,n_disp_win,n_disp_all,"
+    "per_step_ns,total_max_ns,total_mean_ns,med_ns_per_dispatch,"
+    "max_ns_per_dispatch,min_ns_per_dispatch",
 }
 
 
@@ -204,9 +244,12 @@ def _demangle(name: str) -> str:
 
 def _short_name(name: str) -> str:
     n = _demangle(name)
-    n = n.split("(")[0]
-    n = _TEMPLATE_ARGS.sub("", n)
-    return n.strip().split("::")[-1] or name
+    n = _strip_template_args(n)  # before the paren split; see the docstring
+    n = n.split("(")[0].strip()
+    # Drop a leading return type ("void vllm::foo" -> "vllm::foo"). Only the
+    # demangled/formatted columns carry one, so this is a no-op on the rest.
+    n = n.split()[-1] if n.split() else ""
+    return n.split("::")[-1] or name
 
 
 # Kernels whose duration is dominated by waiting on a peer rather than by work.
@@ -586,7 +629,7 @@ def compare(in_csv: str, base: str, other: str, spin_re: str):
     with open(in_csv) as f:
         for row in _csv.DictReader(f):
             key = (int(row["seq_len"]), int(row["batch"]))
-            cells[key][row["kernel"]][row["label"]] = (
+            cells[key][row["kernel_short"]][row["label"]] = (
                 float(row["per_step_ns"]),
                 float(row["total_max_ns"]),
                 int(row["n_disp_win"]) / max(1, int(row["n_steps"])),
