@@ -17,6 +17,13 @@
 # It profiles the SAME harnesses the benchmark numbers come from, pinned to one
 # cell with --only, rather than a separate launcher that can drift out of sync.
 #
+# The parser splits the two signal-pad barriers apart (they share one kernel
+# symbol, dispatched either side of the merge) and reports each as floor + skew.
+# That distinction is the whole point when deciding whether to attack them:
+# barrier 1 is a cross-device RAW guard a put-based producer could delete,
+# barrier 2 is a WAR guard on buffer reuse that stays, and skew is neither --
+# it is load imbalance that no barrier change removes.
+#
 # Usage (hardware partition must ALREADY match the mode; this does not switch):
 #   rocm-smi --setcomputepartition SPX
 #   ./run_paged_kerntime.sh spx
@@ -39,10 +46,18 @@ VLLM_SRC="${VLLM_SRC:-$SCRIPT_DIR}"
 PARSER="$VLLM_SRC/tests/kernels/attention/parse_rocprof_kernels.py"
 CSV="${CSV:-$VLLM_SRC/kerntime_paged.csv}"
 
-# 8192/1024 is the cell where CPX trails SPX; 131072/1024 is the cell where it
-# wins. Profiling both in one go makes the difference between them readable
-# instead of asserted.
-CELLS="${CELLS:-8192,1024 131072,1024}"
+# 8K first, across the batch range, because that is where CPX trails SPX and
+# therefore where the per-kernel breakdown has something to explain. The three
+# batches are not redundant:
+#   B1    -- one sequence over 8 XCDs, ~1024 tokens each. Attention work is
+#            near nothing, so whatever is left IS the fixed Starscream cost:
+#            barriers, merge, dispatch. The cleanest read on the floor.
+#   B64   -- the cell that wins at 16 query heads; shows the floor being
+#            amortised rather than removed.
+#   B1024 -- attention-dominated, so it bounds how small the fixed cost is
+#            relative to real work.
+# 131072,1024 stays as the contrast: same kernels, CPX ahead.
+CELLS="${CELLS:-8192,1 8192,64 8192,1024 131072,1024}"
 NUM_ITERS="${NUM_ITERS:-20}"
 CPX_SIZE="${CPX_SIZE:-8}"
 TOP="${TOP:-15}"
@@ -68,6 +83,7 @@ if [[ "$MODE" == "reparse" ]]; then
         found=1
         python3 "$PARSER" --db-glob "$CELL_DIR/**/*.db" \
             --label "$LBL" --seq-len "$S" --batch "$B" \
+            --num-iters "$NUM_ITERS" \
             --top "$TOP" --out-csv "$CSV" "${RAW_ARG[@]}"
     done
     [[ "$found" -eq 1 ]] || { echo "ERROR: no S*_B*/**.db under $DIR" >&2; exit 1; }
@@ -90,9 +106,18 @@ case "$MODE" in
     ;;
   cpx)
     HARNESS="$VLLM_SRC/test_harness_1_paged_cpx.py"
-    # CPX: --num-blocks is PER RANK, so 131072/8 keeps the total pool -- and
-    # therefore the KV scatter pattern -- the same as the SPX side. Getting this
-    # wrong makes the two runs differ in TLB/cache behaviour, not just partition.
+    # CPX: --num-blocks is PER RANK, so 131072/8 keeps the KV footprint on the
+    # PHYSICAL GPU the same as the SPX side. The device's capacity is fixed --
+    # CPX does not grant 8x the HBM -- so 131072 per rank is not an alternative
+    # worth profiling; it is a machine that does not exist, one that counts each
+    # logical GPU as an extra GPU instead of a slice of the measured one.
+    #
+    # Each rank consequently scatters over an 8x smaller range and its reads
+    # stay in its own memory partition. That locality is what Starscream buys by
+    # using the topology explicitly, and it is paid for by making the cross-XCD
+    # merge explicit -- barriers and a peer-pointer kernel where SPX has the
+    # hardware do it. This script's per-kernel breakdown is how they are told
+    # apart: QKV time carries the locality, merge and barrier carry the price.
     NUM_BLOCKS="${NUM_BLOCKS:-16384}"
     DEVICES="${DEVICES:-0,1,2,3,4,5,6,7}"
     export TORCH_SYMM_MEM_DISABLE_MULTICAST="${TORCH_SYMM_MEM_DISABLE_MULTICAST:-1}"
@@ -154,9 +179,13 @@ for CELL in $CELLS; do
     fi
     echo "  found $NDB db file(s) ($([[ $MODE == cpx ]] && echo 'expect one per rank' || echo 'expect 1'))"
 
+    # --num-iters is passed for the step-count cross-check only: the parser
+    # derives the window from the trace, then says so loudly if the two
+    # disagree. Without it a mis-anchored window is silent.
     PYTHONPATH="$VLLM_SRC" python3 "$PARSER" \
         --db-glob "$CELL_DIR/**/*.db" \
         --label "$MODE" --seq-len "$S" --batch "$B" \
+        --num-iters "$NUM_ITERS" \
         --top "$TOP" --out-csv "$CSV" "${RAW_ARG[@]}"
 done
 

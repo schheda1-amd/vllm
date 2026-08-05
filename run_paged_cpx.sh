@@ -11,10 +11,25 @@
 #   spx -> rocm-smi --setcomputepartition SPX
 #   cpx -> rocm-smi --setcomputepartition CPX
 #
-# Pass --num-blocks the SAME on both sides or the comparison is not
-# apples-to-apples (different KV scatter -> different TLB/cache behaviour):
+# --num-blocks is PER RANK on the cpx side, so divide by the world size to keep
+# the KV footprint on the PHYSICAL GPU the same:
 #   ./run_paged_cpx.sh spx --num-blocks 131072
-#   ./run_paged_cpx.sh cpx --num-blocks 131072
+#   ./run_paged_cpx.sh cpx --num-blocks 16384     # 16384 x 8 == 131072
+#
+# The device's KV capacity is fixed; CPX does not grant 8x the HBM. Running the
+# cpx side at 131072 per rank is not a "control" for the locality -- it is an
+# 8x larger machine, which is a thing Starscream can never be run on. It would
+# be treating each logical GPU as an additional GPU rather than as a slice of
+# the one in front of you.
+#
+# So the smaller per-XCD pool is not a confound to be subtracted out. It IS
+# what Starscream buys: reads stay inside one XCD's memory partition instead of
+# scattering across the whole device. What it costs is that the cross-XCD
+# softmax merge -- which SPX gets implicitly from the hardware -- becomes
+# explicit: two signal-pad barriers and a peer-pointer merge kernel on every
+# decode step. Starscream wins where the locality outruns that cost and loses
+# where it does not (small batch, short context). To see the two sides apart,
+# read the per-kernel breakdown from run_paged_kerntime.sh, not a pool-size knob.
 
 set -euo pipefail
 

@@ -48,6 +48,24 @@ Totals mix warmup, one-time setup (KV-cache fill, RNG) and the steady state.
 A single end-of-run barrier that spins for 100 ms is one dispatch out of ~46
 and would swamp a mean. The median per dispatch is what maps onto the harness's
 reported us/step, so it is the column the compare view leads with.
+
+The two barriers are separated, and so are floor and skew
+---------------------------------------------------------
+``fused_paged_merge`` dispatches ONE barrier kernel symbol twice per decode
+step, on either side of the merge. Left folded into a single row they average
+together, which is the one shape that cannot answer whether the barriers are
+worth attacking: barrier 1 guards a cross-device RAW and could be deleted by a
+put-based producer, while barrier 2 guards buffer reuse and stays regardless.
+:func:`_split_barrier_phases` tells them apart by position relative to the merge
+kernel.
+
+Each barrier is then split again, across ranks rather than across dispatches.
+The rank that arrives LAST barely waits, so its per-dispatch median is close to
+the barrier's irreducible arrive/spin/release cost; the spread up to the slowest
+rank is time spent waiting for peers. Hence the ``minrank_us`` column beside
+``max_us``: floor and skew respond to completely different fixes. Removing a
+barrier removes the floor. It does not remove the skew -- that is work
+imbalance, and a put-based scheme can only let transfers hide behind it.
 """
 
 from __future__ import annotations
@@ -82,8 +100,9 @@ _IDENT = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
 # this file is APPENDED to across runs that may be days and a parser revision
 # apart. Both ends therefore check the header rather than trusting it.
 CSV_HEADER = (
-    "label,seq_len,batch,kernel,n_ranks,n_dispatch,"
-    "total_max_ns,total_mean_ns,med_ns_per_dispatch,max_ns_per_dispatch"
+    "label,seq_len,batch,kernel,n_ranks,n_steps,n_disp_win,n_disp_all,"
+    "per_step_ns,total_max_ns,total_mean_ns,med_ns_per_dispatch,"
+    "max_ns_per_dispatch,min_ns_per_dispatch"
 )
 
 # The schema written before per-dispatch medians were carried. Recognised only
@@ -91,9 +110,21 @@ CSV_HEADER = (
 # old ns_per_dispatch is a MEAN, and a mean over dispatches is exactly the
 # statistic one out-of-loop barrier of ~100 ms wrecks; silently sliding it into
 # the median column would produce a table that looks fine and is wrong.
-_LEGACY_HEADER = (
-    "label,seq_len,batch,kernel,n_ranks,n_dispatch,max_ns,mean_ns,ns_per_dispatch"
-)
+_LEGACY_HEADERS = {
+    "label,seq_len,batch,kernel,n_ranks,n_dispatch,max_ns,mean_ns,ns_per_dispatch",
+    # Pre-window schema: its med_ns_per_dispatch is a real median, but summing
+    # it across kernels assumed one dispatch per step, which charges the step
+    # with one-time KV-cache fill. Not convertible without the dispatch counts.
+    "label,seq_len,batch,kernel,n_ranks,n_dispatch,"
+    "total_max_ns,total_mean_ns,med_ns_per_dispatch,max_ns_per_dispatch",
+    # Pre-min schema. Every column it has is still correct, but its barrier rows
+    # are the *unsplit* symbol -- one row covering both call sites -- and it
+    # carries no min-across-ranks column, so neither barrier-1-vs-barrier-2 nor
+    # overhead-vs-skew can be recovered from it. Re-parsing the dbs is cheap.
+    "label,seq_len,batch,kernel,n_ranks,n_steps,n_disp_win,n_disp_all,"
+    "per_step_ns,total_max_ns,total_mean_ns,med_ns_per_dispatch,"
+    "max_ns_per_dispatch",
+}
 
 
 def _csv_header_of(path: str) -> str:
@@ -104,7 +135,7 @@ def _csv_header_of(path: str) -> str:
 def _schema_error(path: str, found: str) -> SystemExit:
     what = (
         "the schema of an older parser revision"
-        if found == _LEGACY_HEADER
+        if found in _LEGACY_HEADERS
         else "an unrecognised schema"
     )
     return SystemExit(
@@ -112,9 +143,10 @@ def _schema_error(path: str, found: str) -> SystemExit:
         f"  found:    {found}\n"
         f"  expected: {CSV_HEADER}\n"
         "\n"
-        "These rows are not auto-converted: the old ns_per_dispatch column is a\n"
-        "mean, not the median this parser reports, so reusing it would silently\n"
-        "change what the table means. Delete the CSV and re-parse the .db files\n"
+        "These rows are not auto-converted: the old per-dispatch columns cannot\n"
+        "be turned into per-step costs without the dispatch counts this schema\n"
+        "carries, and guessing would silently change what the table means.\n"
+        "Delete the CSV and re-parse the .db files\n"
         "already on disk -- this costs no re-profiling and no partition flip:\n"
         f"  rm -f {path}\n"
         "  ./run_paged_kerntime.sh reparse kern_spx_<ts> spx\n"
@@ -180,6 +212,83 @@ def _short_name(name: str) -> str:
 # Kernels whose duration is dominated by waiting on a peer rather than by work.
 # Reported separately from the busy total; see the module docstring.
 _SPIN_DEFAULT = r"signal_pad_barrier|ncclDevKernel|ncclKernel|rccl"
+
+# fused_paged_merge calls the SAME barrier kernel twice per decode step, so both
+# call sites land on one row and their very different costs are averaged into a
+# number that answers nothing. They are told apart by position relative to the
+# merge kernel; see _split_barrier_phases.
+_BARRIER_DEFAULT = r"signal_pad_barrier"
+_MERGE_DEFAULT = r"fused_paged_merge"
+
+_PHASE_TAG = {1: " [1: pre-merge]", 2: " [2: post-merge]"}
+
+# The kernel the steady-state window is anchored on: dispatched exactly once per
+# decode step by both harnesses, under either partition mode, and present in
+# every cell. Naming it beats inferring it -- see the comment in parse_db.
+_ANCHOR_DEFAULT = r"paged_attention_ll4mi_QKV"
+
+
+def _split_barrier_phases(ka, barrier_re, merge_re):
+    """Split the one barrier symbol into its two per-step call sites.
+
+    ``starscream_paged_symm_merge.fused_paged_merge`` dispatches the same
+    ``_signal_pad_barrier_kernel`` before and after the merge:
+
+        reduce -> barrier 1 -> merge -> barrier 2 -> (next step) barrier 1 -> ...
+
+    They are not interchangeable. Barrier 1 is a cross-device RAW guard that a
+    put-based producer could delete outright; barrier 2 is a WAR guard on buffer
+    reuse that stays. Reported as one row they average together, which is
+    precisely the number that cannot inform whether the put is worth building.
+
+    Classification is by ORDER, not parity: for each barrier dispatch, look at
+    the next barrier-or-merge event on the same agent. A merge next means this
+    was barrier 1; another barrier next means the merge already happened and
+    this is barrier 2. Parity would work only if the steady-state window always
+    opened on the same call site, which it does not -- the window is anchored on
+    the QKV kernel and clips whole steps, so which barrier lands first depends
+    on the cell. The tail dispatch, which has no successor inside the trace,
+    falls back to the mirrored backward rule.
+
+    Returns ``ka`` unchanged when either kernel is absent (the SPX side has
+    neither), so this is a no-op on the baseline.
+    """
+    import bisect
+
+    bnames = [n for n in ka if barrier_re.search(n)]
+    mnames = [n for n in ka if merge_re.search(n)]
+    if not bnames or not mnames:
+        return ka
+
+    merge_starts = sorted(s for n in mnames for s, _ in ka[n])
+    barrier_starts = sorted(s for n in bnames for s, _ in ka[n])
+
+    def _after(xs, t):
+        i = bisect.bisect_right(xs, t)
+        return xs[i] if i < len(xs) else None
+
+    def _before(xs, t):
+        i = bisect.bisect_left(xs, t)
+        return xs[i - 1] if i > 0 else None
+
+    def _phase(t):
+        nm, nb = _after(merge_starts, t), _after(barrier_starts, t)
+        if nm is not None and (nb is None or nm < nb):
+            return 1
+        if nb is not None:
+            return 2
+        # No successor: this is the last barrier in the trace. Mirror the rule
+        # backwards -- if the most recent event was the merge, we are behind it.
+        pm, pb = _before(merge_starts, t), _before(barrier_starts, t)
+        if pm is not None and (pb is None or pm > pb):
+            return 2
+        return 1
+
+    out = {n: v for n, v in ka.items() if n not in bnames}
+    for n in bnames:
+        for s, e in ka[n]:
+            out.setdefault(n + _PHASE_TAG[_phase(s)], []).append((s, e))
+    return out
 
 
 def _resolve(con, *candidates):
@@ -255,17 +364,35 @@ def _median(xs):
     return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
-def parse_db(db_path: str, raw: bool):
-    """Return ({kernel: (n, total_ns, median_ns, max_ns)}, rank_busy_ns).
+def parse_db(
+    db_path: str,
+    raw: bool,
+    spin_re: str,
+    warmup: int,
+    barrier_re: str = _BARRIER_DEFAULT,
+    merge_re: str = _MERGE_DEFAULT,
+    anchor_re: str = _ANCHOR_DEFAULT,
+):
+    """Return per-kernel timings restricted to the steady-state window.
+
+    ``({kernel: (n_win, total_win, med, max, n_all)}, busy, n_steps, anchor,
+    (n_outside, ns_outside))``.
 
     One db can hold several agents (rocprof sees every device the process
     touched). Under torchrun each rank's process drives one XCD, so keying on
     the agent with the most kernel time picks that rank's device and drops
     idle ones.
 
-    Durations come back per dispatch rather than pre-SUMmed: the median is the
-    steady-state per-step cost, and a total alone cannot distinguish "expensive
-    every step" from "one 100 ms outlier at the end".
+    Durations come back per dispatch rather than pre-SUMmed: a total alone
+    cannot distinguish "expensive every step" from "one 100 ms outlier at the
+    end", and the per-step cost needs the dispatch COUNT, not just the sum.
+
+    Counting dispatches is what separates a per-step kernel from setup. In a
+    20-iteration run the attention kernels are dispatched once per step while
+    the RNG that fills the KV cache is dispatched 2-4 times total and the
+    allocator's zero-fill hundreds of times, none of them in the timed region.
+    Treating every kernel as once-per-step charges the step with megabytes of
+    one-time cache fill and inflates both sides of an SPX-vs-CPX comparison.
     """
     con = sqlite3.connect(db_path)
     try:
@@ -284,7 +411,7 @@ def parse_db(db_path: str, raw: bool):
             )
 
         rows = con.execute(
-            f'SELECT kd.agent_id, ks."{name_col}", (kd."end" - kd.start) '
+            f'SELECT kd.agent_id, ks."{name_col}", kd.start, kd."end" '
             f"FROM rocpd_kernel_dispatch kd "
             f'JOIN {ksym} ks ON kd.kernel_id = ks."{id_col}"' + agent_filter
         ).fetchall()
@@ -294,22 +421,134 @@ def parse_db(db_path: str, raw: bool):
         per_agent: dict[int, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
-        for aid, name, dur in rows:
+        for aid, name, start, end in rows:
             key = name if raw else _short_name(name)
-            per_agent[int(aid)][key].append(float(dur or 0.0))
+            per_agent[int(aid)][key].append((int(start), int(end)))
 
         busiest = max(
             per_agent,
-            key=lambda a: sum(sum(v) for v in per_agent[a].values()),
+            key=lambda a: sum(
+                sum(e - s for s, e in v) for v in per_agent[a].values()
+            ),
         )
+        ka = per_agent[busiest]
+
+        # Before anything is measured, separate the two barrier call sites.
+        # Both halves still match the spin regex, so their classification as
+        # peer-wait rather than work is unchanged.
+        if barrier_re and merge_re:
+            ka = _split_barrier_phases(
+                ka, re.compile(barrier_re, re.I), re.compile(merge_re, re.I)
+            )
+
+        # Anchor the steady-state window on the once-per-step QKV kernel. The
+        # profile spans the WHOLE process -- KV-cache fill, allocator zeroing,
+        # RNG -- while the benchmark number covers only the timed loop, so a
+        # per-step total that includes setup answers a question nobody asked.
+        # Anchoring on a per-step kernel rather than on wall clock keeps this
+        # independent of how long setup happened to take.
+        #
+        # The anchor is NAMED, not inferred as "busiest non-spin kernel". That
+        # heuristic holds only while attention dominates, and the cells where it
+        # does not are exactly the ones being profiled: at 8192/B1 a rank owns
+        # 1024 tokens and its QKV kernel is a few microseconds, which the
+        # KV-cache fill RNG -- hundreds of milliseconds, dispatched 2-4 times in
+        # the whole run -- outweighs by orders of magnitude. Anchoring there
+        # yields a 1-3 dispatch "window" spanning setup, n_steps in the single
+        # digits, and per-step costs off by the ratio of the two. The failure is
+        # silent: every column still prints, plausibly.
+        spin = re.compile(spin_re, re.I) if spin_re else None
+        anchor = None
+        if anchor_re:
+            arx = re.compile(anchor_re, re.I)
+            hits = [n for n in ka if arx.search(n)]
+            if hits:
+                # Several QKV instantiations can coexist in one trace (mfma4 for
+                # gqa_ratio <= 4, mfma16 above). Take the most-dispatched, and
+                # on a tie the busiest -- the one that ran every step.
+                anchor = max(
+                    hits, key=lambda n: (len(ka[n]), sum(e - s for s, e in ka[n]))
+                )
+        if anchor is None:
+            cand = [n for n in ka if not (spin and spin.search(n))] or list(ka)
+            anchor = max(cand, key=lambda n: sum(e - s for s, e in ka[n]))
+        starts = sorted(s for s, _ in ka[anchor])
+        # Drop the harness's warmup iterations: they run before the timed
+        # region and are the slow, cold-cache ones.
+        skip = warmup if len(starts) - warmup >= 2 else 0
+        if len(starts) - skip >= 2:
+            # Half-open [first anchor start, LAST anchor start): whole steps
+            # only. Closing on the last anchor's *end* instead would cut the
+            # final step's trailing kernels -- the reduce and the merge run
+            # after the QKV they belong to -- so those kernels would show
+            # n-1 dispatches over n steps and come out ~5% cheap. Dropping the
+            # final partial step costs one sample and biases nothing, because
+            # the divisor drops with it.
+            win_start, win_end = starts[skip], starts[-1]
+            n_steps = len(starts) - skip - 1
+        else:  # too few dispatches to bound a step; take everything
+            win_start = starts[0]
+            win_end = max(e for _, e in ka[anchor]) + 1
+            n_steps = len(starts)
+
         out = {}
         busy = 0.0
-        for name, durs in per_agent[busiest].items():
-            out[name] = (len(durs), sum(durs), _median(durs), max(durs))
+        outside_n = 0
+        outside_ns = 0.0
+        for name, disp in ka.items():
+            durs = [float(e - s) for s, e in disp if win_start <= s < win_end]
+            if not durs:  # setup/teardown only: no dispatch in the timed region
+                outside_n += 1
+                outside_ns += sum(float(e - s) for s, e in disp)
+                continue
+            out[name] = (len(durs), sum(durs), _median(durs), max(durs), len(disp))
             busy += sum(durs)
-        return out, busy
+        return out, busy, n_steps, anchor, (outside_n, outside_ns)
     finally:
         con.close()
+
+
+def _barrier_summary(rows, n_steps):
+    """Print the barrier-1 / barrier-2 split and its overhead-vs-skew shape.
+
+    Only fires when :func:`_split_barrier_phases` found both call sites, i.e.
+    on the CPX side. The two questions it answers, in the order they matter:
+
+      * how much of the per-step cost is barrier 1 -- the one a put-based
+        producer could delete -- versus barrier 2, which is a WAR guard on
+        buffer reuse and stays either way;
+      * how much of each barrier is irreducible cost versus rank skew. The
+        rank that arrives LAST barely waits, so its per-dispatch median is
+        close to the pure arrive/spin/release cost; the spread up to the
+        slowest rank is peers it had to wait for. Deleting a barrier removes
+        the first part. It does not remove the second -- skew is work
+        imbalance, and a put-based scheme only lets transfers hide behind it.
+    """
+    phases = {}
+    for r in rows:
+        for ph, tag in _PHASE_TAG.items():
+            if r[0].endswith(tag):
+                phases[ph] = r
+    if len(phases) != 2:
+        return
+    print()
+    print("  barrier call sites (same kernel symbol, split by position):")
+    total = 0.0
+    for ph in sorted(phases):
+        name, _nranks, n, mx, _mean, med, _dmax, _sp, per_step, _na, dmin = (
+            phases[ph]
+        )
+        total += per_step
+        skew = max(0.0, med - dmin)
+        role = "RAW, cross-device read-after-write" if ph == 1 else \
+               "WAR, buffer reuse next step"
+        print(
+            f"    barrier {ph} ({role}):\n"
+            f"      {per_step / 1e3:8.2f} us/step over {n / n_steps:.1f} "
+            f"dispatch(es); floor {dmin / 1e3:.2f} us + skew "
+            f"{skew / 1e3:.2f} us"
+        )
+    print(f"    both barriers: {total / 1e3:.2f} us/step")
 
 
 def compare(in_csv: str, base: str, other: str, spin_re: str):
@@ -320,9 +559,12 @@ def compare(in_csv: str, base: str, other: str, spin_re: str):
     present in one mode only (the merge and the barrier exist only under CPX)
     shows a blank on the missing side rather than a fabricated zero-delta.
 
-    Leads with median us/dispatch, which maps onto the harness's us/step and is
-    immune to a single out-of-loop outlier. Spin/collective kernels are listed
-    but excluded from the totals line, and marked with a ``*`` -- see the module
+    Leads with us PER STEP, not per dispatch, which is what maps onto the
+    harness's us/step. The distinction is not pedantic: the KV-cache RNG is
+    dispatched 2-4 times in a 20-step run and the allocator's zero-fill several
+    hundred, so a per-dispatch column summed down the table reports a step cost
+    that includes one-time setup. Spin/collective kernels are listed but
+    excluded from the totals, and marked with a ``*`` -- see the module
     docstring for why folding a peer-wait into a work comparison misleads.
     """
     import csv as _csv
@@ -337,7 +579,7 @@ def compare(in_csv: str, base: str, other: str, spin_re: str):
     if header != CSV_HEADER:
         raise _schema_error(in_csv, header)
 
-    # (S, B) -> kernel -> label -> (med_ns, total_ns)
+    # (S, B) -> kernel -> label -> (per_step_ns, total_ns, disp_per_step)
     cells: dict[tuple[int, int], dict[str, dict[str, tuple]]] = defaultdict(
         lambda: defaultdict(dict)
     )
@@ -345,20 +587,21 @@ def compare(in_csv: str, base: str, other: str, spin_re: str):
         for row in _csv.DictReader(f):
             key = (int(row["seq_len"]), int(row["batch"]))
             cells[key][row["kernel"]][row["label"]] = (
-                float(row["med_ns_per_dispatch"]),
+                float(row["per_step_ns"]),
                 float(row["total_max_ns"]),
+                int(row["n_disp_win"]) / max(1, int(row["n_steps"])),
             )
 
     for (s, b), kernels in sorted(cells.items()):
         def _is_spin(name):
             return bool(spin and spin.search(name))
 
-        def _med(v, lbl):
+        def _ps(v, lbl):  # per-step ns for label, or None
             return v[lbl][0] if lbl in v else None
 
         tot = {
             lbl: sum(
-                (_med(v, lbl) or 0.0)
+                (_ps(v, lbl) or 0.0)
                 for n, v in kernels.items()
                 if not _is_spin(n)
             )
@@ -371,21 +614,22 @@ def compare(in_csv: str, base: str, other: str, spin_re: str):
             f"delta={(tot[other] - tot[base]) / 1e3:+.1f}"
         )
         print(
-            f"{'kernel':<46} {base + '_us':>10} {other + '_us':>10} "
-            f"{'delta_us':>10} {base + '_ms':>9} {other + '_ms':>9}"
+            f"{'kernel':<46} {'d/stp':>6} {base + '_us':>10} "
+            f"{other + '_us':>10} {'delta_us':>10} {base + '_ms':>9} "
+            f"{other + '_ms':>9}"
         )
-        print("-" * 98)
+        print("-" * 105)
 
         # Sort by the delta, largest regression first: the point of this view is
         # which kernel is responsible for the gap, not which is biggest.
         def _delta(item):
             v = item[1]
-            return -((_med(v, other) or 0.0) - (_med(v, base) or 0.0))
+            return -((_ps(v, other) or 0.0) - (_ps(v, base) or 0.0))
 
         for name, v in sorted(kernels.items(), key=_delta):
             mark = "*" if _is_spin(name) else " "
             disp = name if len(name) <= 45 else name[:42] + "..."
-            a, o = _med(v, base), _med(v, other)
+            a, o = _ps(v, base), _ps(v, other)
             sa = f"{a / 1e3:>10.1f}" if a is not None else f"{'-':>10}"
             so = f"{o / 1e3:>10.1f}" if o is not None else f"{'-':>10}"
             d = ((o or 0.0) - (a or 0.0)) / 1e3
@@ -393,10 +637,16 @@ def compare(in_csv: str, base: str, other: str, spin_re: str):
             to = v[other][1] / 1e6 if other in v else None
             sta = f"{ta:>9.3f}" if ta is not None else f"{'-':>9}"
             sto = f"{to:>9.3f}" if to is not None else f"{'-':>9}"
-            print(f"{mark}{disp:<45} {sa} {so} {d:>+10.1f} {sta} {sto}")
+            dps = v[other][2] if other in v else v[base][2]
+            print(
+                f"{mark}{disp:<45} {dps:>6.1f} {sa} {so} {d:>+10.1f} "
+                f"{sta} {sto}"
+            )
         if spin:
             print("  * spin/collective: time is waiting on a peer, not work; "
                   "excluded from the us/step totals above")
+        print("  d/stp = dispatches per step; costs are per step, so a kernel "
+              "that does not run every step contributes its true share")
 
 
 def main():
@@ -433,10 +683,45 @@ def main():
              "Pass '' to disable.",
     )
     p.add_argument(
+        "--barrier-regex",
+        default=_BARRIER_DEFAULT,
+        help="barrier kernel to split into its pre-merge and post-merge call "
+             "sites. Pass '' to leave the two folded into one row.",
+    )
+    p.add_argument(
+        "--merge-regex",
+        default=_MERGE_DEFAULT,
+        help="kernel that separates the two barrier call sites; the split is "
+             "by position relative to it",
+    )
+    p.add_argument(
+        "--anchor-regex",
+        default=_ANCHOR_DEFAULT,
+        help="once-per-step kernel the steady-state window is anchored on. "
+             "Pass '' to fall back to 'busiest non-spin kernel', which "
+             "misfires at small batch where setup outweighs attention.",
+    )
+    p.add_argument(
         "--top",
         type=int,
         default=15,
         help="print only the N slowest kernels (0 = all)",
+    )
+    p.add_argument(
+        "--num-iters",
+        type=int,
+        default=0,
+        help="the harness's --num-iters, used only to sanity-check the derived "
+             "step count (0 = skip the check)",
+    )
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=3,
+        help="anchor-kernel dispatches to drop from the front of the steady-"
+             "state window. Default 3 matches the warmup loop in "
+             "test_harness_1_paged*.py; change both together or the per-step "
+             "cost includes cold-cache iterations the benchmark does not time.",
     )
     args = p.parse_args()
 
@@ -457,25 +742,65 @@ def main():
     meds: dict[str, list[float]] = defaultdict(list)
     maxes: dict[str, list[float]] = defaultdict(list)
     counts: dict[str, list[int]] = defaultdict(list)
+    counts_all: dict[str, list[int]] = defaultdict(list)
     busies: list[float] = []
+    steps: list[int] = []
+    anchors: set[str] = set()
+    outside = [0, 0.0]
     n_ok = 0
     for db in dbs:
         try:
-            per_kernel, busy = parse_db(db, args.raw)
+            per_kernel, busy, n_steps, anchor, outs = parse_db(
+                db, args.raw, args.spin_regex, args.warmup,
+                args.barrier_regex, args.merge_regex, args.anchor_regex,
+            )
         except Exception as e:  # noqa: BLE001
             print(f"[kern] WARN: {db}: {e}", file=sys.stderr)
             continue
         n_ok += 1
         busies.append(busy)
-        for name, (n, total, med, mx) in per_kernel.items():
+        steps.append(n_steps)
+        anchors.add(anchor)
+        outside[0] = max(outside[0], outs[0])
+        outside[1] = max(outside[1], outs[1])
+        for name, (n, total, med, mx, n_all) in per_kernel.items():
             totals[name].append(total)
             meds[name].append(med)
             maxes[name].append(mx)
             counts[name].append(n)
+            counts_all[name].append(n_all)
 
     if n_ok == 0:
         print(f"[kern] ERROR: nothing parsed from {len(dbs)} db(s)", file=sys.stderr)
         raise SystemExit(1)
+
+    # Ranks run the same loop, so a disagreement here means one rank's trace is
+    # truncated -- the per-step divisor would then differ per rank. Use the max
+    # and say so rather than silently averaging over a broken rank.
+    n_steps = max(steps)
+    if len(set(steps)) > 1:
+        print(
+            f"[kern] WARN: ranks disagree on step count {sorted(set(steps))}; "
+            f"using {n_steps}",
+            file=sys.stderr,
+        )
+
+    # The window is the divisor for every per-step number below, so check it
+    # against what the harness ran instead of trusting it. The timed loop is
+    # num_iters steps and the half-open window keeps num_iters - 1 of them, so a
+    # mismatch means the anchor is not the once-per-step kernel -- the failure
+    # mode is a plausible-looking table scaled by an arbitrary factor, which is
+    # worse than an error. Only checked when --num-iters is passed, since the
+    # parser cannot otherwise know it.
+    if args.num_iters and n_steps != args.num_iters - 1:
+        print(
+            f"[kern] WARN: window has {n_steps} steps but --num-iters "
+            f"{args.num_iters} implies {args.num_iters - 1}. The anchor "
+            f"({', '.join(sorted(anchors))[:60]}) is probably not the "
+            f"once-per-step kernel; per-step costs are scaled wrong. "
+            f"Check --anchor-regex and --warmup.",
+            file=sys.stderr,
+        )
 
     spin = re.compile(args.spin_regex, re.I) if args.spin_regex else None
 
@@ -488,12 +813,20 @@ def main():
             (
                 name,
                 len(per_rank),
-                max(counts[name]),
+                max(counts[name]),  # dispatches inside the window
                 max(per_rank),  # total, max across ranks
                 sum(per_rank) / len(per_rank),  # total, mean across ranks
                 max(meds[name]),  # median per dispatch, max across ranks
                 max(maxes[name]),  # slowest single dispatch anywhere
                 bool(spin and spin.search(name)),
+                max(per_rank) / n_steps,  # per-step cost
+                max(counts_all[name]),  # dispatches over the whole process
+                # Median per dispatch, MIN across ranks. On a barrier this is
+                # the rank that arrived last and therefore waited least, so it
+                # approximates the barrier's irreducible cost; the spread up to
+                # the max column is rank skew. On a work kernel the two columns
+                # are close and the min means little.
+                min(meds[name]),
             )
         )
     rows.sort(key=lambda r: -r[3])
@@ -506,8 +839,18 @@ def main():
         f"B={args.batch} dbs={n_ok}"
     )
     print(
-        f"  rank GPU-busy (all kernels, per-rank total): "
-        f"max {max(busies) / 1e6:.3f} ms   mean {sum(busies) / len(busies) / 1e6:.3f} ms"
+        f"  steady-state window: {n_steps} steps, anchored on "
+        f"{', '.join(sorted(anchors))[:52]} (warmup {args.warmup} dropped)"
+    )
+    if outside[0]:
+        print(
+            f"  excluded as setup/teardown: {outside[0]} kernel(s), "
+            f"{outside[1] / 1e6:.3f} ms with no dispatch in the window"
+        )
+    print(
+        f"  rank GPU-busy in window (per-rank total)   : "
+        f"max {max(busies) / 1e6:.3f} ms   "
+        f"mean {sum(busies) / len(busies) / 1e6:.3f} ms"
     )
     print(
         f"  sum of per-kernel maxes                    : "
@@ -515,25 +858,36 @@ def main():
         f"(work {work_ns / 1e6:.3f} + spin/collective {spin_ns / 1e6:.3f})"
     )
     print(
-        f"{'kernel':<46} {'ranks':>5} {'disp':>5} {'tot_max_ms':>11} "
-        f"{'tot_mean_ms':>11} {'med_us':>9} {'max_us':>9}"
+        f"  work per step                              : "
+        f"{work_ns / n_steps / 1e3:.1f} us"
     )
-    print("-" * 108)
+    print(
+        f"{'kernel':<46} {'ranks':>5} {'d/stp':>6} {'per_step_us':>12} "
+        f"{'tot_max_ms':>11} {'med_us':>9} {'max_us':>9} {'minrank_us':>10}"
+    )
+    print("-" * 119)
     shown = rows if args.top <= 0 else rows[: args.top]
-    for name, nranks, n, mx, mean, med, dmax, is_spin in shown:
+    for (
+        name, nranks, n, mx, mean, med, dmax, is_spin, per_step, n_all, dmin
+    ) in shown:
         disp = name if len(name) <= 45 else name[:42] + "..."
         mark = "*" if is_spin else " "
         print(
-            f"{mark}{disp:<45} {nranks:>5} {n:>5} {mx / 1e6:>11.3f} "
-            f"{mean / 1e6:>11.3f} {med / 1e3:>9.2f} {dmax / 1e3:>9.2f}"
+            f"{mark}{disp:<45} {nranks:>5} {n / n_steps:>6.1f} "
+            f"{per_step / 1e3:>12.1f} {mx / 1e6:>11.3f} "
+            f"{med / 1e3:>9.2f} {dmax / 1e3:>9.2f} {dmin / 1e3:>10.2f}"
         )
     if args.top > 0 and len(rows) > args.top:
         rest = sum(r[3] for r in rows[args.top:])
         print(f" {'(' + str(len(rows) - args.top) + ' more)':<45} "
-              f"{'':>5} {'':>5} {rest / 1e6:>11.3f}")
+              f"{'':>5} {'':>6} {rest / n_steps / 1e3:>12.1f} {rest / 1e6:>11.3f}")
     if spin:
         print("  * spin/collective: duration is dominated by waiting on a peer "
               "(and, for an out-of-loop collective, by rank skew), not by work")
+    print("  med_us/max_us are the per-dispatch median taken across ranks with "
+          "max; minrank_us takes it with min")
+
+    _barrier_summary(rows, n_steps)
 
     if args.out_csv:
         # Append, so check the existing header BEFORE writing: appending
@@ -548,11 +902,14 @@ def main():
         with open(args.out_csv, "a") as f:
             if not have:
                 f.write(CSV_HEADER + "\n")
-            for name, nranks, n, mx, mean, med, dmax, _ in rows:
+            for (
+                name, nranks, n, mx, mean, med, dmax, _, per_step, n_all, dmin
+            ) in rows:
                 safe = name.replace(",", ";")
                 f.write(
                     f"{args.label},{args.seq_len},{args.batch},{safe},"
-                    f"{nranks},{n},{mx:.0f},{mean:.0f},{med:.0f},{dmax:.0f}\n"
+                    f"{nranks},{n_steps},{n},{n_all},{per_step:.0f},"
+                    f"{mx:.0f},{mean:.0f},{med:.0f},{dmax:.0f},{dmin:.0f}\n"
                 )
         print(f"[kern] appended {len(rows)} rows to {args.out_csv}")
 

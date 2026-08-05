@@ -49,11 +49,20 @@ from vllm.utils.torch_utils import (
 # (8.4 GiB each) 8 ranks would want 67 GiB, and under a memory partition that
 # splits HBM per XCD it will not fit at all.
 #
-# NOTE for SPX-vs-CPX comparisons: the block IDs are drawn uniformly from
-# [0, NUM_BLOCKS), so a different pool size means a different KV scatter
-# pattern and therefore different TLB/cache behaviour. If the machine has the
-# headroom (NPS1, where all XCDs see the full 192 GiB), pass
-# --num-blocks 131072 to match test_harness_1_paged.py exactly.
+# NOTE for SPX-vs-CPX comparisons: pass world_size x LESS than the SPX side,
+# e.g. --num-blocks 16384 against test_harness_1_paged.py's 131072. The
+# physical GPU's KV capacity is fixed; CPX does not hand the process 8x the
+# HBM. Passing 131072 here controls for nothing -- it models an 8x larger
+# machine, i.e. it treats each logical GPU as an extra GPU rather than as a
+# slice of the one being measured, which is not a machine Starscream runs on.
+#
+# A rank's block IDs are therefore drawn from an 8x smaller range and its reads
+# stay inside its own memory partition. That locality is not a confound; it is
+# the mechanism Starscream exploits by taking the topology explicitly into
+# account. What it costs is explicit communication: the cross-XCD softmax merge
+# that SPX gets implicitly from the hardware becomes two signal-pad barriers
+# plus a peer-pointer kernel per decode step. Neither side is free, and the
+# per-kernel profile (run_paged_kerntime.sh) is where the two show up apart.
 DEFAULT_NUM_BLOCKS = 32 * 1024
 PARTITION_SIZE_ROCM = 256
 
