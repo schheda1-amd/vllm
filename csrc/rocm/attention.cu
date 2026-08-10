@@ -1422,9 +1422,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
   }  // warpid == 0
 }
 
-// Grid: (num_heads, num_seqs).
+// Grid: (num_heads / HEADS_PER_BLOCK, num_seqs), where HEADS_PER_BLOCK is
+// derived below from BATCH_HEADS. It is 1 -- and the grid is the original
+// (num_heads, num_seqs) -- unless the host opted into head batching.
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0,
+          bool BATCH_HEADS = false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -1445,150 +1448,17 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     // and skips the final divide / fp8 conversion / `out` store -- the
     // cross-rank merge finishes the softmax.
     float* __restrict__ ss_meta_out) {
-  const auto num_heads = gridDim.x;
-  const auto head_idx = blockIdx.x;
-  const auto seq_idx = blockIdx.y;
-
-  // NOTE queries with sequence len > 1 are prefills and taken care by another
-  // kernel.
-  if (query_start_loc_ptr != nullptr &&
-      (query_start_loc_ptr[seq_idx + 1] - query_start_loc_ptr[seq_idx] != 1)) {
-    return;
-  }
-
-  const int seq_len = seq_lens[seq_idx];
-  const int num_partitions = DIVIDE_ROUND_UP(seq_len, PARTITION_SIZE);
-  const auto warpid = threadIdx.x / WARP_SIZE;
-
-  // NUM_THREADS == HEAD_SIZE for this kernel, so threadIdx.x indexes the head
-  // dimension of the record directly.
-  float* ss_meta_ptr =
-      (ss_meta_out != nullptr)
-          ? ss_meta_out +
-                (static_cast<int64_t>(seq_idx) * num_heads + head_idx) *
-                    (HEAD_SIZE + 2)
-          : nullptr;
-
-  // Finite stand-in for -inf: an all-empty merge then evaluates exp(M - M) = 1
-  // instead of exp(-inf + inf) = NaN.
-  constexpr float SS_NEG_HUGE = -3.0e38f;
-
-  // Under a context split a rank can own zero tokens for this sequence. Bail
-  // out before `last_valid_partition` goes negative and the loads below read
-  // out of bounds; emit an identity record so the merge ignores this rank.
-  if (num_partitions == 0) {
-    if (ss_meta_ptr != nullptr) {
-      ss_meta_ptr[threadIdx.x] = 0.0f;
-      if (threadIdx.x == 0) {
-        ss_meta_ptr[HEAD_SIZE] = 0.0f;
-        ss_meta_ptr[HEAD_SIZE + 1] = SS_NEG_HUGE;
-      }
-    } else {
-      const int64_t query_start_off = static_cast<int64_t>(
-          query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx);
-      OUTT* out_ptr = out + query_start_off * num_heads * HEAD_SIZE +
-                      static_cast<int64_t>(head_idx) * HEAD_SIZE;
-      if constexpr (std::is_same<OUTT, bit8_t>::value) {
-        out_ptr[threadIdx.x] = __hip_cvt_float_to_fp8(
-            0.0f, vllm::fp8::fp8_type::__default_saturation,
-            vllm::fp8::fp8_type::__default_interpret);
-      } else {
-        out_ptr[threadIdx.x] = from_float<scalar_t>(0.0f);
-      }
-    }
-    return;
-  }
-
-  __shared__ float shared_global_exp_sum;
-  // max num partitions supported is warp_size * NPAR_LOOPS
-  __shared__ float shared_exp_sums[NPAR_LOOPS * WARP_SIZE];
-
-  if (warpid == 0) {
-    const float* max_logits_ptr = max_logits +
-                                  seq_idx * num_heads * max_num_partitions +
-                                  head_idx * max_num_partitions;
-
-    // valid partition is the last valid partition in case threadid > num
-    // partitions
-    int valid_partition[NPAR_LOOPS];
-    float reg_max_logit[NPAR_LOOPS];
-    const int last_valid_partition = num_partitions - 1;
-
-  #pragma unroll
-    for (int i = 0; i < NPAR_LOOPS; i++) {
-      const auto partition_no = i * WARP_SIZE + threadIdx.x;
-      valid_partition[i] =
-          (partition_no < num_partitions) ? partition_no : last_valid_partition;
-    }
-  #pragma unroll
-    for (int i = 0; i < NPAR_LOOPS; i++) {
-      reg_max_logit[i] = max_logits_ptr[valid_partition[i]];
-    }
-    float max_logit = reg_max_logit[0];
-  #pragma unroll
-    for (int i = 1; i < NPAR_LOOPS; i++) {
-      max_logit = fmaxf(max_logit, reg_max_logit[i]);
-    }
-
-  #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
-    }
-
-    const float* exp_sums_ptr = exp_sums +
-                                seq_idx * num_heads * max_num_partitions +
-                                head_idx * max_num_partitions;
-
-    float rescaled_exp_sum[NPAR_LOOPS];
-  #pragma unroll
-    for (int i = 0; i < NPAR_LOOPS; i++) {
-      rescaled_exp_sum[i] = exp_sums_ptr[valid_partition[i]];
-    }
-  #pragma unroll
-    for (int i = 0; i < NPAR_LOOPS; i++) {
-      const auto partition_no = i * WARP_SIZE + threadIdx.x;
-      rescaled_exp_sum[i] *= (partition_no < num_partitions)
-                                 ? expf(reg_max_logit[i] - max_logit)
-                                 : 0.0f;
-    }
-    float global_exp_sum = rescaled_exp_sum[0];
-  #pragma unroll
-    for (int i = 1; i < NPAR_LOOPS; i++) {
-      global_exp_sum += rescaled_exp_sum[i];
-    }
-  #pragma unroll
-    for (int i = 0; i < NPAR_LOOPS; i++) {
-      const auto partition_no = i * WARP_SIZE + threadIdx.x;
-      shared_exp_sums[partition_no] = rescaled_exp_sum[i];
-    }
-
-  #pragma unroll
-    for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-      global_exp_sum += __shfl_xor(global_exp_sum, mask);
-    }
-    if (threadIdx.x == 0) {
-      shared_global_exp_sum = global_exp_sum;
-      if (ss_meta_ptr != nullptr) {
-        // Both halves of the softmax state are live here; publish them before
-        // they go out of scope with the warp-0 block.
-        ss_meta_ptr[HEAD_SIZE] = global_exp_sum;
-        ss_meta_ptr[HEAD_SIZE + 1] = max_logit;
-      }
-    }
-  }  // warpid == 0
-  const scalar_t* tmp_out_ptr =
-      tmp_out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
-      head_idx * max_num_partitions * HEAD_SIZE + threadIdx.x;
-  // Partition slots this instantiation carries in registers.
+  // Partition slots this instantiation carries in registers. Hoisted above the
+  // body because HEADS_PER_BLOCK is defined in terms of it.
   //
   // TMP_CHUNK == 0 means "a full warp's worth", which is the only width the
   // multi-pass NPAR_LOOPS > 1 path below can use -- it strides both `tmps` and
   // `shared_exp_sums` by exactly that. The host passes a smaller power of two
-  // when the whole context fits in fewer partitions than a warp, and that is
-  // the entire point of the parameter: what used to be a mandatory 16/32/64
-  // staircase (JCHUNK tiers, each entered by a runtime branch, each CLAMPING
-  // past the real partition count rather than skipping) becomes one unrolled
-  // loop of exactly next_pow2(max_num_partitions) iterations.
+  // when the whole context fits in fewer partitions than a warp: what used to
+  // be a mandatory 16/32/64 staircase (JCHUNK tiers, each entered by a runtime
+  // branch, each CLAMPING past the real partition count rather than skipping)
+  // becomes one unrolled loop of exactly next_pow2(max_num_partitions)
+  // iterations.
   //
   // The old floor cost real time whenever a rank owned few partitions. Under a
   // CPX/Starscream context split at 8K global context a rank owns 1024 tokens
@@ -1610,74 +1480,316 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   constexpr int MAX_NPAR =
       (TMP_CHUNK == 0 || TMP_CHUNK > WARP_SIZE) ? WARP_SIZE : TMP_CHUNK;
 
-  scalar_t tmps[MAX_NPAR];
+  // Instances per block. Batched phase 1 tiles ONE wave as (instance,
+  // partition), so the factor is fixed at WARP_SIZE / MAX_NPAR -- both powers
+  // of two with MAX_NPAR <= WARP_SIZE, so it always divides exactly.
+  //
+  // Derived from the DEVICE wave width rather than passed in, so it is correct
+  // on wave64 (CDNA, 64/4 = 16) and wave32 (Navi, 32/4 = 8) alike. The host
+  // sizes the grid with the same quotient taken from deviceProp.warpSize, so
+  // the two agree on every arch without the launcher having to know which one
+  // it is compiling for.
+  constexpr int HEADS_PER_BLOCK = BATCH_HEADS ? (WARP_SIZE / MAX_NPAR) : 1;
+  // Single-pass only: NPAR_LOOPS > 1 already saturates the lanes, and strides
+  // shared_exp_sums by a full warp, so there is nothing to batch.
+  static_assert(!BATCH_HEADS || NPAR_LOOPS == 1,
+                "head batching is single-pass only");
+
+  // gridDim.x is num_heads / HEADS_PER_BLOCK. The host only selects a batch
+  // factor that divides num_heads, so this recovers it exactly and no head is
+  // out of range below.
+  const auto num_heads = gridDim.x * HEADS_PER_BLOCK;
+  const auto head_base = blockIdx.x * HEADS_PER_BLOCK;
+  const auto seq_idx = blockIdx.y;
+
+  // NOTE queries with sequence len > 1 are prefills and taken care by another
+  // kernel.
+  if (query_start_loc_ptr != nullptr &&
+      (query_start_loc_ptr[seq_idx + 1] - query_start_loc_ptr[seq_idx] != 1)) {
+    return;
+  }
+
+  const int seq_len = seq_lens[seq_idx];
+  const int num_partitions = DIVIDE_ROUND_UP(seq_len, PARTITION_SIZE);
+  const auto warpid = threadIdx.x / WARP_SIZE;
+  // Only the batched phase 1 indexes by lane. Unused in the HEADS_PER_BLOCK==1
+  // instantiations, where warp 0's threadIdx.x is already the lane id.
+  [[maybe_unused]] const auto laneid = threadIdx.x % WARP_SIZE;
+
+  // NUM_THREADS == HEAD_SIZE for this kernel, so threadIdx.x indexes the head
+  // dimension of the record directly.
+  const int64_t ss_seq_base =
+      static_cast<int64_t>(seq_idx) * num_heads * (HEAD_SIZE + 2);
+
+  // Finite stand-in for -inf: an all-empty merge then evaluates exp(M - M) = 1
+  // instead of exp(-inf + inf) = NaN.
+  constexpr float SS_NEG_HUGE = -3.0e38f;
+
+  // Under a context split a rank can own zero tokens for this sequence. Bail
+  // out before `last_valid_partition` goes negative and the loads below read
+  // out of bounds; emit an identity record so the merge ignores this rank.
+  // seq_len is per SEQUENCE, so this is uniform across the block's heads.
+  if (num_partitions == 0) {
+  #pragma unroll
+    for (int hl = 0; hl < HEADS_PER_BLOCK; hl++) {
+      const auto h = head_base + hl;
+      if (ss_meta_out != nullptr) {
+        float* p = ss_meta_out + ss_seq_base +
+                   static_cast<int64_t>(h) * (HEAD_SIZE + 2);
+        p[threadIdx.x] = 0.0f;
+        if (threadIdx.x == 0) {
+          p[HEAD_SIZE] = 0.0f;
+          p[HEAD_SIZE + 1] = SS_NEG_HUGE;
+        }
+      } else {
+        const int64_t query_start_off = static_cast<int64_t>(
+            query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx);
+        OUTT* out_ptr = out + query_start_off * num_heads * HEAD_SIZE +
+                        static_cast<int64_t>(h) * HEAD_SIZE;
+        if constexpr (std::is_same<OUTT, bit8_t>::value) {
+          out_ptr[threadIdx.x] = __hip_cvt_float_to_fp8(
+              0.0f, vllm::fp8::fp8_type::__default_saturation,
+              vllm::fp8::fp8_type::__default_interpret);
+        } else {
+          out_ptr[threadIdx.x] = from_float<scalar_t>(0.0f);
+        }
+      }
+    }
+    return;
+  }
+
+  __shared__ float shared_global_exp_sum[HEADS_PER_BLOCK];
+  // Batched: exactly one wave's worth (HEADS_PER_BLOCK * MAX_NPAR == WARP_SIZE)
+  // instead of HEADS_PER_BLOCK copies of a warp, which would be 16x oversized
+  // at MAX_NPAR == 4. Unbatched: NPAR_LOOPS * WARP_SIZE, as before.
+  constexpr int SHARED_EXP_SUMS = (HEADS_PER_BLOCK > 1)
+                                      ? (HEADS_PER_BLOCK * MAX_NPAR)
+                                      : (NPAR_LOOPS * WARP_SIZE);
+  __shared__ float shared_exp_sums[SHARED_EXP_SUMS];
+
+  if (warpid == 0) {
+    if constexpr (HEADS_PER_BLOCK > 1) {
+      // lane -> (head within block, partition). Contiguity is not incidental:
+      // max_logits is [seq][head][max_num_partitions], so HEADS_PER_BLOCK heads
+      // x MAX_NPAR partitions is one contiguous run of WARP_SIZE floats, and
+      // this load is a single coalesced 256B fetch. The unbatched path below
+      // reads the same line WARP_SIZE/num_partitions times over.
+      const int hl = laneid / MAX_NPAR;
+      const int part = laneid % MAX_NPAR;
+      const int last_valid_partition = num_partitions - 1;
+      const int vpart = (part < num_partitions) ? part : last_valid_partition;
+      const int64_t base =
+          static_cast<int64_t>(seq_idx) * num_heads * max_num_partitions +
+          static_cast<int64_t>(head_base + hl) * max_num_partitions;
+
+      const float my_max_logit = max_logits[base + vpart];
+      float max_logit = my_max_logit;
+      // Segmented butterfly: every mask is < MAX_NPAR and the groups are
+      // MAX_NPAR-aligned, so a shuffle can never cross into another head.
+      // Depth log2(MAX_NPAR) rather than log2(WARP_SIZE).
+  #pragma unroll
+      for (int mask = MAX_NPAR / 2; mask >= 1; mask /= 2) {
+        max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+      }
+
+      float rescaled_exp_sum = exp_sums[base + vpart];
+      rescaled_exp_sum *=
+          (part < num_partitions) ? expf(my_max_logit - max_logit) : 0.0f;
+      // laneid == hl * MAX_NPAR + part, which is exactly the slot phase 2
+      // reads back.
+      shared_exp_sums[laneid] = rescaled_exp_sum;
+
+      float global_exp_sum = rescaled_exp_sum;
+  #pragma unroll
+      for (int mask = MAX_NPAR / 2; mask >= 1; mask /= 2) {
+        global_exp_sum += __shfl_xor(global_exp_sum, mask);
+      }
+      if (part == 0) {
+        shared_global_exp_sum[hl] = global_exp_sum;
+        if (ss_meta_out != nullptr) {
+          // Both halves of the softmax state are live here; publish them
+          // before they go out of scope with the warp-0 block.
+          float* p = ss_meta_out + ss_seq_base +
+                     static_cast<int64_t>(head_base + hl) * (HEAD_SIZE + 2);
+          p[HEAD_SIZE] = global_exp_sum;
+          p[HEAD_SIZE + 1] = max_logit;
+        }
+      }
+    } else {
+      const auto head_idx = head_base;
+      const float* max_logits_ptr = max_logits +
+                                    seq_idx * num_heads * max_num_partitions +
+                                    head_idx * max_num_partitions;
+
+      // valid partition is the last valid partition in case threadid > num
+      // partitions
+      int valid_partition[NPAR_LOOPS];
+      float reg_max_logit[NPAR_LOOPS];
+      const int last_valid_partition = num_partitions - 1;
+
+    #pragma unroll
+      for (int i = 0; i < NPAR_LOOPS; i++) {
+        const auto partition_no = i * WARP_SIZE + threadIdx.x;
+        valid_partition[i] =
+            (partition_no < num_partitions) ? partition_no : last_valid_partition;
+      }
+    #pragma unroll
+      for (int i = 0; i < NPAR_LOOPS; i++) {
+        reg_max_logit[i] = max_logits_ptr[valid_partition[i]];
+      }
+      float max_logit = reg_max_logit[0];
+    #pragma unroll
+      for (int i = 1; i < NPAR_LOOPS; i++) {
+        max_logit = fmaxf(max_logit, reg_max_logit[i]);
+      }
+
+    #pragma unroll
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        max_logit = fmaxf(max_logit, __shfl_xor(max_logit, mask));
+      }
+
+      const float* exp_sums_ptr = exp_sums +
+                                  seq_idx * num_heads * max_num_partitions +
+                                  head_idx * max_num_partitions;
+
+      float rescaled_exp_sum[NPAR_LOOPS];
+    #pragma unroll
+      for (int i = 0; i < NPAR_LOOPS; i++) {
+        rescaled_exp_sum[i] = exp_sums_ptr[valid_partition[i]];
+      }
+    #pragma unroll
+      for (int i = 0; i < NPAR_LOOPS; i++) {
+        const auto partition_no = i * WARP_SIZE + threadIdx.x;
+        rescaled_exp_sum[i] *= (partition_no < num_partitions)
+                                   ? expf(reg_max_logit[i] - max_logit)
+                                   : 0.0f;
+      }
+      float global_exp_sum = rescaled_exp_sum[0];
+    #pragma unroll
+      for (int i = 1; i < NPAR_LOOPS; i++) {
+        global_exp_sum += rescaled_exp_sum[i];
+      }
+    #pragma unroll
+      for (int i = 0; i < NPAR_LOOPS; i++) {
+        const auto partition_no = i * WARP_SIZE + threadIdx.x;
+        shared_exp_sums[partition_no] = rescaled_exp_sum[i];
+      }
+
+    #pragma unroll
+      for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+        global_exp_sum += __shfl_xor(global_exp_sum, mask);
+      }
+      if (threadIdx.x == 0) {
+        shared_global_exp_sum[0] = global_exp_sum;
+        if (ss_meta_out != nullptr) {
+          // Both halves of the softmax state are live here; publish them before
+          // they go out of scope with the warp-0 block.
+          float* p = ss_meta_out + ss_seq_base +
+                     static_cast<int64_t>(head_idx) * (HEAD_SIZE + 2);
+          p[HEAD_SIZE] = global_exp_sum;
+          p[HEAD_SIZE + 1] = max_logit;
+        }
+      }
+    }  // HEADS_PER_BLOCK == 1
+  }  // warpid == 0
+
+  // The barrier moved ahead of the tmp_out loads. Previously they were issued
+  // first so they overlapped warp 0's phase 1; with batching there is one
+  // barrier per HEADS_PER_BLOCK heads instead of one per head, and successive
+  // iterations of the head loop below supply the same latency hiding.
+  __syncthreads();
+
   const int last_partition_offset = (num_partitions - 1) * HEAD_SIZE;
   const int num_partition_offset = (num_partitions)*HEAD_SIZE;
 
-  // No zero-init: every slot is written below before it is read. The old code
-  // needed one because a skipped staircase tier left its slots untouched while
-  // the matching accumulate tier was skipped too.
-  #pragma unroll
-  for (int j = 0; j < MAX_NPAR; j++) {
-    // Clamp rather than skip past the last real partition, as before. The
-    // duplicate load is harmless: warp 0 zeroed shared_exp_sums for every
-    // partition_no >= num_partitions, so it contributes nothing to acc.
-    const int off = j * HEAD_SIZE;
-    const int lastj_offset =
-        (off < num_partition_offset) ? off : last_partition_offset;
-    tmps[j] = tmp_out_ptr[lastj_offset];
-  }
-  __syncthreads();
+  // Deliberately NOT #pragma unroll. The trip count is constexpr so the
+  // compiler can still unroll, but forcing it at HEADS_PER_BLOCK == 16 would
+  // let all 16 heads' tmps[] live at once -- 64 bf16 registers to save a loop
+  // counter, which is the register pressure this change exists to avoid.
+  // At HEADS_PER_BLOCK == 1 it collapses to straight-line code either way.
+  for (int hl = 0; hl < HEADS_PER_BLOCK; hl++) {
+    const auto head_idx = head_base + hl;
+    // Weights for this head. Zero when unbatched, so the multi-pass indexing
+    // below is unchanged on that path.
+    const int sh_base = hl * MAX_NPAR;
 
-  // Aggregate tmp_out to out.
-  float acc = 0.0f;
-  #pragma unroll
-  for (int j = 0; j < MAX_NPAR; j++) {
-    acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j];
-  }
+    const scalar_t* tmp_out_ptr =
+        tmp_out +
+        static_cast<int64_t>(seq_idx) * num_heads * max_num_partitions *
+            HEAD_SIZE +
+        static_cast<int64_t>(head_idx) * max_num_partitions * HEAD_SIZE +
+        threadIdx.x;
 
-  for (int p = 1; p < NPAR_LOOPS; p++) {
-    if (num_partitions > p * MAX_NPAR) {
-      int idx = 0;
+    scalar_t tmps[MAX_NPAR];
+    // No zero-init: every slot is written below before it is read. The old code
+    // needed one because a skipped staircase tier left its slots untouched
+    // while the matching accumulate tier was skipped too.
   #pragma unroll
-      for (int j = p * MAX_NPAR * HEAD_SIZE; j < (p + 1) * MAX_NPAR * HEAD_SIZE;
-           j += HEAD_SIZE) {
-        // lastj is last valid partition
-        const int lastj_offset =
-            (j < num_partition_offset) ? j : last_partition_offset;
-        tmps[idx] = tmp_out_ptr[lastj_offset];
-        idx++;
-      }
+    for (int j = 0; j < MAX_NPAR; j++) {
+      // Clamp rather than skip past the last real partition, as before. The
+      // duplicate load is harmless: phase 1 zeroed the weight for every
+      // partition >= num_partitions, so it contributes nothing to acc.
+      const int off = j * HEAD_SIZE;
+      const int lastj_offset =
+          (off < num_partition_offset) ? off : last_partition_offset;
+      tmps[j] = tmp_out_ptr[lastj_offset];
+    }
+
+    // Aggregate tmp_out to out.
+    float acc = 0.0f;
+  #pragma unroll
+    for (int j = 0; j < MAX_NPAR; j++) {
+      acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[sh_base + j];
+    }
+
+    // Multi-pass tail. HEADS_PER_BLOCK == 1 whenever NPAR_LOOPS > 1, so
+    // sh_base is 0 here and this is byte-for-byte the original indexing.
+    for (int p = 1; p < NPAR_LOOPS; p++) {
+      if (num_partitions > p * MAX_NPAR) {
+        int idx = 0;
+  #pragma unroll
+        for (int j = p * MAX_NPAR * HEAD_SIZE;
+             j < (p + 1) * MAX_NPAR * HEAD_SIZE; j += HEAD_SIZE) {
+          // lastj is last valid partition
+          const int lastj_offset =
+              (j < num_partition_offset) ? j : last_partition_offset;
+          tmps[idx] = tmp_out_ptr[lastj_offset];
+          idx++;
+        }
 
   #pragma unroll
-      for (int j = 0; j < MAX_NPAR; j++) {
-        acc += to_float<scalar_t>(tmps[j]) * shared_exp_sums[j + p * MAX_NPAR];
+        for (int j = 0; j < MAX_NPAR; j++) {
+          acc += to_float<scalar_t>(tmps[j]) *
+                 shared_exp_sums[sh_base + j + p * MAX_NPAR];
+        }
       }
     }
-  }
 
-  if (ss_meta_ptr != nullptr) {
-    // Starscream: hand the un-normalized numerator to the cross-rank merge.
-    // The divide by L and any fp8 conversion happen after the merge.
-    ss_meta_ptr[threadIdx.x] = acc;
-    return;
-  }
-  const float inv_global_exp_sum =
-      __fdividef(1.0f, shared_global_exp_sum + 1e-6f);
-  const float out_scale =
-      (fp8_out_scale_ptr != nullptr) ? 1.0f / (*fp8_out_scale_ptr) : 1.0f;
-  acc *= inv_global_exp_sum;
-  acc *= out_scale;
-  const int64_t query_start_off = static_cast<int64_t>(
-      query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx);
-  OUTT* out_ptr = out + query_start_off * num_heads * HEAD_SIZE +
-                  static_cast<int64_t>(head_idx) * HEAD_SIZE;
-  if constexpr (std::is_same<OUTT, bit8_t>::value) {
-    out_ptr[threadIdx.x] =
-        __hip_cvt_float_to_fp8(acc, vllm::fp8::fp8_type::__default_saturation,
-                               vllm::fp8::fp8_type::__default_interpret);
-  } else {
-    out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
+    if (ss_meta_out != nullptr) {
+      // Starscream: hand the un-normalized numerator to the cross-rank merge.
+      // The divide by L and any fp8 conversion happen after the merge.
+      float* p = ss_meta_out + ss_seq_base +
+                 static_cast<int64_t>(head_idx) * (HEAD_SIZE + 2);
+      p[threadIdx.x] = acc;
+      continue;
+    }
+    const float inv_global_exp_sum =
+        __fdividef(1.0f, shared_global_exp_sum[hl] + 1e-6f);
+    const float out_scale =
+        (fp8_out_scale_ptr != nullptr) ? 1.0f / (*fp8_out_scale_ptr) : 1.0f;
+    acc *= inv_global_exp_sum;
+    acc *= out_scale;
+    const int64_t query_start_off = static_cast<int64_t>(
+        query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx);
+    OUTT* out_ptr = out + query_start_off * num_heads * HEAD_SIZE +
+                    static_cast<int64_t>(head_idx) * HEAD_SIZE;
+    if constexpr (std::is_same<OUTT, bit8_t>::value) {
+      out_ptr[threadIdx.x] =
+          __hip_cvt_float_to_fp8(acc, vllm::fp8::fp8_type::__default_saturation,
+                                 vllm::fp8::fp8_type::__default_interpret);
+    } else {
+      out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
+    }
   }
 }
 
@@ -2242,8 +2354,18 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 }
 
 // Grid: (num_heads, num_seqs).
+//
+// BATCH_HEADS is accepted but IGNORED here: head batching is implemented only
+// in the GFX9 body. That is safe because the batched grid is only ever launched
+// by paged_attention_custom_launcher, and CALL_CUSTOM_LAUNCHER routes gfx11/
+// gfx12 to paged_attention_custom_launcher_navi instead, which never batches.
+// The true instantiation below is therefore compiled but unreachable on this
+// arch. If that dispatch ever changes, this body must gain the same
+// HEADS_PER_BLOCK handling or it will silently reduce 1/HEADS_PER_BLOCK of the
+// heads against a wrong num_heads stride.
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0,
+          bool BATCH_HEADS = false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -2946,8 +3068,18 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 }
 
 // Grid: (num_heads, num_seqs).
+//
+// BATCH_HEADS is accepted but IGNORED here: head batching is implemented only
+// in the GFX9 body. That is safe because the batched grid is only ever launched
+// by paged_attention_custom_launcher, and CALL_CUSTOM_LAUNCHER routes gfx11/
+// gfx12 to paged_attention_custom_launcher_navi instead, which never batches.
+// The true instantiation below is therefore compiled but unreachable on this
+// arch. If that dispatch ever changes, this body must gain the same
+// HEADS_PER_BLOCK handling or it will silently reduce 1/HEADS_PER_BLOCK of the
+// heads against a wrong num_heads stride.
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0,
+          bool BATCH_HEADS = false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -3173,8 +3305,18 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma4_kernel(
 }
 
 // Grid: (num_heads, num_seqs).
+//
+// BATCH_HEADS is accepted but IGNORED here: head batching is implemented only
+// in the GFX9 body. That is safe because the batched grid is only ever launched
+// by paged_attention_custom_launcher, and CALL_CUSTOM_LAUNCHER routes gfx11/
+// gfx12 to paged_attention_custom_launcher_navi instead, which never batches.
+// The true instantiation below is therefore compiled but unreachable on this
+// arch. If that dispatch ever changes, this body must gain the same
+// HEADS_PER_BLOCK handling or it will silently reduce 1/HEADS_PER_BLOCK of the
+// heads against a wrong num_heads stride.
 template <typename scalar_t, typename OUTT, int HEAD_SIZE, int NUM_THREADS,
-          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0>
+          int PARTITION_SIZE, int NPAR_LOOPS, int TMP_CHUNK = 0,
+          bool BATCH_HEADS = false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                // [num_seqs, num_heads, head_size]
@@ -3216,14 +3358,70 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
 // TMP_CHUNK sizes the reduce kernel's per-thread partition register array;
 // 0 means a full warp's worth, which is the pre-existing behaviour and the
 // only value valid when NPAR_LOOPS > 1. See the kernel body for why.
-#define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS, TMP_CHUNK)                      \
+//
+// BATCH selects the batched phase-1 mapping. The kernel derives the actual
+// instances-per-block from its own (compile-time) WARP_SIZE; `heads_per_block`
+// below is the host's copy of the same quotient, taken from the runtime
+// deviceProp.warpSize, and is what sizes the grid. They must agree, which is
+// why neither side hardcodes a wave width.
+#define LAUNCH_CUSTOM_REDUCTION_HPB(NPAR_LOOPS, TMP_CHUNK, BATCH)           \
   paged_attention_ll4mi_reduce_kernel<T, OUTT, HEAD_SIZE, HEAD_SIZE,        \
                                       PARTITION_SIZE, NPAR_LOOPS,           \
-                                      TMP_CHUNK>                            \
-      <<<reduce_grid, reduce_block, 0, stream>>>(                           \
+                                      TMP_CHUNK, BATCH>                     \
+      <<<dim3(num_heads / heads_per_block, num_seqs), reduce_block, 0,      \
+         stream>>>(                                                         \
           out_ptr, exp_sums_ptr, max_logits_ptr, tmp_out_ptr, seq_lens_ptr, \
           query_start_loc_ptr, max_num_partitions, fp8_out_scale_ptr,      \
           ss_meta_out_ptr);
+
+// Should one reduce block serve `cand` (seq, head) instances instead of one?
+//
+// Two conditions. The factor has to divide num_heads, because the grid is
+// num_heads / factor and a remainder would drop heads on the floor. And the
+// grid still has to fill the device: batching divides the block count by the
+// factor, and at low batch there is little to divide -- at 8192/B1 a CPX rank
+// has 16 reduce blocks for 38 CUs, and folding 16 heads into one would leave a
+// single block running on an otherwise idle XCD.
+//
+// cu_count is the CURRENT device's CU count, which under CPX is one XCD's 38
+// rather than the package's 304, so this adapts to the partition mode without
+// being told which one is active.
+static inline bool reduce_should_batch(int num_heads, int num_seqs, int cand,
+                                       int cu_count) {
+  constexpr int MIN_BLOCKS_PER_CU = 8;
+  if (cand <= 1 || num_heads % cand != 0) return false;
+  const int64_t blocks = static_cast<int64_t>(num_heads / cand) * num_seqs;
+  return blocks >= static_cast<int64_t>(cu_count) * MIN_BLOCKS_PER_CU;
+}
+
+// Single-pass reduction: batch when it pays, otherwise the original mapping.
+// Only those two instantiations exist per TMP_CHUNK -- anything in between is
+// unreachable, since the wave tiling has to land exactly.
+#define LAUNCH_CUSTOM_REDUCTION_1PASS(TMP_CHUNK)                             \
+  do {                                                                       \
+    /* Mirrors the kernel's MAX_NPAR exactly. Computed in two steps rather   \
+       than one ternary because `WARP_SIZE / (TMP_CHUNK)` with TMP_CHUNK     \
+       spelled 0 at the call site is a division by a literal zero -- never   \
+       evaluated, but it still trips -Wdiv-by-zero. */                       \
+    const int _max_npar = ((TMP_CHUNK) == 0 || (TMP_CHUNK) > WARP_SIZE)      \
+                              ? WARP_SIZE                                    \
+                              : (TMP_CHUNK);                                 \
+    const int _cand = WARP_SIZE / _max_npar;                                 \
+    if (reduce_should_batch(num_heads, num_seqs, _cand, cu_count)) {         \
+      heads_per_block = _cand;                                               \
+      LAUNCH_CUSTOM_REDUCTION_HPB(1, TMP_CHUNK, true);                       \
+    } else {                                                                 \
+      heads_per_block = 1;                                                   \
+      LAUNCH_CUSTOM_REDUCTION_HPB(1, TMP_CHUNK, false);                      \
+    }                                                                        \
+  } while (0)
+
+// Multi-pass (NPAR_LOOPS > 1) never batches: the wave is already full.
+#define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS, TMP_CHUNK)         \
+  do {                                                         \
+    heads_per_block = 1;                                       \
+    LAUNCH_CUSTOM_REDUCTION_HPB(NPAR_LOOPS, TMP_CHUNK, false); \
+  } while (0)
 
 template <typename T, typename KVT, vllm::Fp8KVCacheDataType KV_DTYPE,
           int BLOCK_SIZE, int HEAD_SIZE, typename OUTT, int PARTITION_SIZE_OLD,
@@ -3352,8 +3550,12 @@ void paged_attention_custom_launcher(
       break;
   }
 
-  dim3 reduce_grid(num_heads, num_seqs);
   dim3 reduce_block(head_size);
+  // Set by the LAUNCH_CUSTOM_REDUCTION* macros; the grid is
+  // (num_heads / heads_per_block, num_seqs).
+  int heads_per_block = 1;
+  const int cu_count =
+      at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
   // reduction kernel supports upto 8 NPAR_loops * 64 (warp_size) * 256
   // (partition size) = 128K context length
@@ -3376,23 +3578,23 @@ void paged_attention_custom_launcher(
     while (tmp_chunk < max_num_partitions) tmp_chunk *= 2;
     switch (tmp_chunk) {
       case 4:
-        LAUNCH_CUSTOM_REDUCTION(1, 4);
+        LAUNCH_CUSTOM_REDUCTION_1PASS(4);
         break;
       case 8:
-        LAUNCH_CUSTOM_REDUCTION(1, 8);
+        LAUNCH_CUSTOM_REDUCTION_1PASS(8);
         break;
       case 16:
-        LAUNCH_CUSTOM_REDUCTION(1, 16);
+        LAUNCH_CUSTOM_REDUCTION_1PASS(16);
         break;
       case 32:
-        LAUNCH_CUSTOM_REDUCTION(1, 32);
+        LAUNCH_CUSTOM_REDUCTION_1PASS(32);
         break;
       default:
         // At or above warp width. Pass 0 rather than a literal: the host's
         // WARP_SIZE is a runtime device query while the kernel's is a
         // compile-time constant per arch, so 0 ("full warp") is the only way
         // to say this that stays correct on both wave64 and wave32.
-        LAUNCH_CUSTOM_REDUCTION(1, 0);
+        LAUNCH_CUSTOM_REDUCTION_1PASS(0);
         break;
     }
     return;
@@ -3540,19 +3742,21 @@ void paged_attention_custom_launcher_navi(
       break;
   }
 
-  dim3 reduce_grid(num_heads, num_seqs);
   dim3 reduce_block(head_size);
+  // Always 1 here: see the note below on why this launcher keeps the original
+  // mapping. The macros still read it to size the grid.
+  int heads_per_block = 1;
   const int warp_size = 32;
   const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warp_size);
   // reduction kernel supports upto 16 NPAR_loops * 32 (warp_size) * 256
   // (partition size) = 128K context length
   //
-  // TMP_CHUNK is 0 (full warp width) throughout: this launcher keeps exactly
-  // its previous behaviour. The shrink the other launcher does for
-  // npar_loops == 1 would apply here too -- it is the same kernel and the same
-  // arithmetic -- but it is an optimisation for a context-parallel split that
-  // this path does not run, and it is not measurable on the hardware in front
-  // of this change. Adopt it here only alongside a Navi measurement.
+  // TMP_CHUNK is 0 (full warp width) throughout, and head batching is off: this
+  // launcher keeps exactly its previous behaviour. Both optimisations the other
+  // launcher applies for npar_loops == 1 would work here -- same kernel, same
+  // arithmetic -- but they target a context-parallel split this path does not
+  // run, and neither is measurable on the hardware in front of this change.
+  // Adopt them here only alongside a Navi measurement.
   switch (npar_loops) {
     case 1:
       LAUNCH_CUSTOM_REDUCTION(1, 0);

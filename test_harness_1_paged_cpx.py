@@ -175,6 +175,7 @@ def benchmark_config(
     num_blocks: int = DEFAULT_NUM_BLOCKS,
     merge: str = "fused",
     scatter_heads: bool = False,
+    query_all_gather: bool = True,
     group=None,
 ) -> dict:
     # Same seed on every rank: the query and the global block table must match,
@@ -291,13 +292,66 @@ def benchmark_config(
 
     k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
-    def run_local(meta_out):
+    # ---- query all-gather -------------------------------------------------
+    # Context-parallel attention needs EVERY head on every rank -- a rank owns a
+    # slice of the context, not a slice of the heads -- while the TP-sharded
+    # projection ahead of it produced only num_query_heads/world. The deployed
+    # path closes that gap per attention layer at
+    # vllm/v1/attention/backends/triton_attn.py:322:
+    #
+    #     query = get_dcp_group().all_gather(query.contiguous(), dim=-2)
+    #
+    # Until now this harness modelled the POST-gather state (identical seeds ->
+    # every rank already holds the full query) and never paid for it, so the
+    # collective was absent from every CPX number while SPX has no equivalent
+    # cost. Reinstated here so it is measured rather than assumed.
+    q_local = q_gather_buf = None
+    if query_all_gather and world > 1 and num_query_heads % world == 0:
+        heads_local = num_query_heads // world
+        # Slicing the identically-seeded full query means the gather
+        # RECONSTRUCTS `query` bit-exactly (asserted below), so switching this
+        # on changes the cost and nothing else -- --check stays valid and the
+        # A/B against the old numbers is clean.
+        q_local = query[
+            :, rank * heads_local : (rank + 1) * heads_local, :
+        ].contiguous()
+        q_gather_buf = torch.empty(
+            (world * num_seqs, heads_local, head_size),
+            dtype=dtype,
+            device=device,
+        )
+
+    def query_all_gathered():
+        """Full-width query from per-rank head shards.
+
+        Mirrors DeviceCommunicatorBase.all_gather(dim=-2)
+        (base_device_communicator.py:134) rather than approximating it: the
+        movedim+reshape is not bookkeeping, it forces a full transpose copy of
+        the gathered tensor on top of the collective, and that copy is part of
+        what the deployed path pays.
+        """
+        if q_local is None:
+            return query
+        dist.all_gather_into_tensor(q_gather_buf, q_local)
+        return (
+            q_gather_buf.view(world, num_seqs, -1, head_size)
+            .movedim(0, 1)
+            .reshape(num_seqs, num_query_heads, head_size)
+        )
+
+    if q_local is not None:
+        # Cheap, once, outside the timed region: if the reconstruction were
+        # wrong every rank would attend with a permuted query and the
+        # SPX-vs-CPX comparison would be measuring two different problems.
+        torch.testing.assert_close(query_all_gathered(), query, rtol=0, atol=0)
+
+    def run_local(meta_out, q):
         ops.paged_attention_rocm(
             output,
             exp_sums,
             max_logits,
             tmp_output,
-            query,
+            q,
             key_cache,
             value_cache,
             num_kv_heads,
@@ -314,10 +368,13 @@ def benchmark_config(
             starscream_meta_out=meta_out,
         )
 
+    # The gather is INSIDE the step, ahead of attention, because that is where
+    # the deployed path pays it -- once per attention layer, on the decode
+    # critical path, not once per token.
     if merge == "fused":
 
         def run_step():
-            run_local(meta)
+            run_local(meta, query_all_gathered())
             fused_paged_merge(
                 merged,
                 symm_buf,
@@ -331,7 +388,7 @@ def benchmark_config(
     else:
 
         def run_step():
-            run_local(meta)
+            run_local(meta, query_all_gathered())
             starscream_merge(meta, merged, world, gathered=gathered)
 
     if check:
@@ -527,6 +584,19 @@ def main():
              "every head (world x redundant); fused merge only.",
     )
     parser.add_argument(
+        "--query-all-gather",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="gather the full-width query from per-rank head shards inside the "
+             "timed step, as the deployed path does per attention layer "
+             "(triton_attn.py:322). Context-parallel attention needs every "
+             "head on every rank, but the TP-sharded projection ahead of it "
+             "produces num_query_heads/world. --no-query-all-gather restores "
+             "the old behaviour (every rank starts with the full query, "
+             "collective free) -- that is what every CPX number collected "
+             "before this flag existed corresponds to.",
+    )
+    parser.add_argument(
         "--only",
         action="append",
         metavar="SEQLEN,BATCH",
@@ -590,6 +660,19 @@ def main():
     # rank all world records regardless of which heads it needs, so narrowing
     # the kernel there would save arithmetic but not one byte of link traffic.
     # Reshaping that collective is a separate change; don't imply it happened.
+    # Same divisibility requirement as head sharding, and the same reason to say
+    # so out loud: silently skipping the gather would drop a per-layer
+    # collective out of the measurement and read as a CPX win.
+    if args.query_all_gather and world > 1 and args.num_query_heads % world != 0:
+        if rank == 0:
+            print(
+                f"  WARNING: num_query_heads={args.num_query_heads} is not "
+                f"divisible by world={world} -- query all-gather disabled, so "
+                f"this run does NOT include the per-layer collective the "
+                f"deployed path pays.",
+                flush=True,
+            )
+
     scatter_heads = args.scatter_heads and merge_mode == "fused" and world > 1
     if scatter_heads and args.num_query_heads % world != 0:
         scatter_heads = False
@@ -620,6 +703,7 @@ def main():
         num_blocks=args.num_blocks,
         merge=merge_mode,
         scatter_heads=scatter_heads,
+        query_all_gather=args.query_all_gather,
         group=group,
     )
 
@@ -679,7 +763,10 @@ def main():
         print(f"  head_size={args.head_size}, block_size={args.block_size}")
         print(f"  dtype={args.dtype}, kv_cache_dtype={args.kv_cache_dtype}")
         print(f"  num_iters={args.num_iters}, num_blocks={args.num_blocks}/rank")
-        print(f"  merge={merge_mode}, scatter_heads={scatter_heads}")
+        print(
+            f"  merge={merge_mode}, scatter_heads={scatter_heads}, "
+            f"query_all_gather={args.query_all_gather}"
+        )
         print()
         print(f"{'SeqLen':>10} {'BatchSize':>10} {'Latency(us)':>12} {'BW(GB/s)':>10}")
         print("-" * 50)
