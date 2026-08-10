@@ -34,8 +34,19 @@
 # Both modes append to the same CSV ($CSV), so the two runs -- which cannot be
 # in the same boot of the partition -- still land in one comparable table.
 #
+# Runs against whatever vllm your shell already imports. It does NOT touch
+# PYTHONPATH and does NOT need a source checkout -- drop this script anywhere
+# and give it explicit paths:
+#
+#   PARSER=/path/to/parse_rocprof_kernels.py \
+#   CPX_HARNESS=/app/vllm/test_harness_1_paged_cpx.py \
+#     ./run_paged_kerntime.sh cpx
+#
 # Env: CELLS ("S,B" list), NUM_ITERS, CPX_SIZE, NUM_BLOCKS, DEVICES, OUT_DIR,
-#      CSV, VLLM_SRC, TOP, RAW=1.
+#      CSV, TOP, RAW=1.
+#      Paths: PARSER, SPX_HARNESS, CPX_HARNESS (each defaults to a location
+#      under VLLM_SRC, which itself defaults to this script's directory).
+#      VLLM_PYTHONPATH to prepend to PYTHONPATH; unset means don't touch it.
 
 set -euo pipefail
 
@@ -43,8 +54,29 @@ MODE="${1:-cpx}"; shift || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VLLM_SRC="${VLLM_SRC:-$SCRIPT_DIR}"
-PARSER="$VLLM_SRC/tests/kernels/attention/parse_rocprof_kernels.py"
+
+# Every path below is an independent override, so this script can be dropped
+# next to an ALREADY-INSTALLED vllm and point at the parser wherever it happens
+# to live. Deriving them all from one root forced the layout of a source
+# checkout onto a machine that only has the installed package.
+PARSER="${PARSER:-$VLLM_SRC/tests/kernels/attention/parse_rocprof_kernels.py}"
+SPX_HARNESS="${SPX_HARNESS:-$VLLM_SRC/test_harness_1_paged.py}"
+CPX_HARNESS="${CPX_HARNESS:-$VLLM_SRC/test_harness_1_paged_cpx.py}"
 CSV="${CSV:-$VLLM_SRC/kerntime_paged.csv}"
+
+# PYTHONPATH is NOT set by default any more.
+#
+# It used to be forced to $VLLM_SRC, which is right for a source checkout with
+# the extension built in place and actively wrong anywhere else: it puts an
+# uncompiled source `vllm/` ahead of the installed package, and the only symptom
+# is "failed to import vllm._rocm_C" from a build that is perfectly fine.
+# Default is now to inherit the environment -- if `python3 -c "import vllm"`
+# works in your shell, it works here.
+#
+# Set VLLM_PYTHONPATH explicitly to prepend something (e.g. a source checkout
+# whose extension you did build in place).
+PY_ENV=()
+[[ -n "${VLLM_PYTHONPATH:-}" ]] && PY_ENV=(PYTHONPATH="$VLLM_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}")
 
 # 8K first, across the batch range, because that is where CPX trails SPX and
 # therefore where the per-kernel breakdown has something to explain. The three
@@ -99,13 +131,13 @@ mkdir -p "$OUT_DIR"
 
 case "$MODE" in
   spx)
-    HARNESS="$VLLM_SRC/test_harness_1_paged.py"
+    HARNESS="$SPX_HARNESS"
     # SPX: one rank owns the whole KV pool.
     NUM_BLOCKS="${NUM_BLOCKS:-131072}"
     DEVICES="${DEVICES:-0}"
     ;;
   cpx)
-    HARNESS="$VLLM_SRC/test_harness_1_paged_cpx.py"
+    HARNESS="$CPX_HARNESS"
     # CPX: --num-blocks is PER RANK, so 131072/8 keeps the KV footprint on the
     # PHYSICAL GPU the same as the SPX side. The device's capacity is fixed --
     # CPX does not grant 8x the HBM -- so 131072 per rank is not an alternative
@@ -130,7 +162,9 @@ esac
 echo "=================================================================="
 echo " Paged-attention per-kernel time (rocprofv3 --kernel-trace)"
 echo "   mode       : $MODE"
-echo "   harness    : $(basename "$HARNESS")"
+echo "   harness    : $HARNESS"
+echo "   parser     : $PARSER"
+echo "   python     : $(python3 -c 'import vllm,os;print(os.path.dirname(vllm.__file__))' 2>/dev/null || echo 'import vllm FAILED')"
 echo "   cells      : $CELLS"
 echo "   num_iters  : $NUM_ITERS   num_blocks: $NUM_BLOCKS$([[ $MODE == cpx ]] && echo ' (per rank)')"
 echo "   devices    : $DEVICES"
@@ -164,7 +198,7 @@ for CELL in $CELLS; do
         RUN=(python3 "$HARNESS" "${HARNESS_ARGS[@]}")
     fi
 
-    env CUDA_VISIBLE_DEVICES="$DEVICES" PYTHONPATH="$VLLM_SRC" \
+    env CUDA_VISIBLE_DEVICES="$DEVICES" "${PY_ENV[@]}" \
         rocprofv3 --kernel-trace --output-format rocpd \
                   -d "$CELL_DIR" \
                   -- "${RUN[@]}" \
@@ -182,7 +216,7 @@ for CELL in $CELLS; do
     # --num-iters is passed for the step-count cross-check only: the parser
     # derives the window from the trace, then says so loudly if the two
     # disagree. Without it a mis-anchored window is silent.
-    PYTHONPATH="$VLLM_SRC" python3 "$PARSER" \
+    env "${PY_ENV[@]}" python3 "$PARSER" \
         --db-glob "$CELL_DIR/**/*.db" \
         --label "$MODE" --seq-len "$S" --batch "$B" \
         --num-iters "$NUM_ITERS" \
